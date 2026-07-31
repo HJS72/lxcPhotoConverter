@@ -1,0 +1,16 @@
+[project]
+name = "lxc-photo-converter-backend"
+version = "0.1.0"
+description = "Automated photo and video import backend"
+requires-python = ">=3.12"
+
+dependencies = [
+  "fastapi==0.116.1",
+  "uvicorn[standard]==0.35.0",
+  "sqlalchemy==2.0.42",
+  "pydantic==2.11.7",
+  "pydantic-settings==2.10.1",
+  "apscheduler==3.10.4",
+  "watchdog==4.0.1",
+  "python-multipart==0.0.20",
+]

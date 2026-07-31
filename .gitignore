@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Runtime data
+backend/data/
+data/
+*.db
+*.sqlite3
+
+# Env files
+.env
+backend/.env
+
+# Logs
+*.log

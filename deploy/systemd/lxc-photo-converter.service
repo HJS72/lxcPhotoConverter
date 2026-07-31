@@ -1,0 +1,26 @@
+[Unit]
+Description=lxcPhotoConverter FastAPI Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=photoimport
+Group=photoimport
+WorkingDirectory=/opt/lxc-photo-converter/backend
+EnvironmentFile=/etc/lxc-photo-converter/lxc-photo-converter.env
+ExecStart=/opt/lxc-photo-converter/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/lxc-photo-converter/backend/data /srv/import /srv/export /srv/failed
+
+[Install]
+WantedBy=multi-user.target
