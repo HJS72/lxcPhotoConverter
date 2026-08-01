@@ -11,6 +11,19 @@ export type StatusResponse = {
   last_scan_trigger: string | null;
   scan_interval_seconds: number;
   scan_schedule_enabled: boolean;
+  workflow_sources: WorkflowSourceStatusItem[];
+};
+
+export type WorkflowSourceStatusItem = {
+  workflow_id: number;
+  workflow_name: string;
+  source_path: string;
+  enabled: boolean;
+  files_total: number;
+  queued_files: number;
+  processed_files: number;
+  failed_files: number;
+  duplicate_files: number;
 };
 
 export type ScanScheduleResponse = {
@@ -89,6 +102,12 @@ export type NetworkDriveClonePayload = {
   enabled: boolean;
 };
 
+export type NetworkShareDiscoveryPayload = {
+  server: string;
+  username: string;
+  password: string;
+};
+
 const readJson = async <T,>(url: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(url, init);
   if (!response.ok) {
@@ -142,6 +161,14 @@ export const deleteWorkflow = (workflowId: number) =>
   });
 
 export const fetchNetworkDrives = () => readJson<NetworkDriveItem[]>("/api/network-drives");
+export const fetchNetworkDriveFolders = (driveId: number) =>
+  readJson<string[]>(`/api/network-drives/${driveId}/folders`);
+export const discoverNetworkDriveShares = (payload: NetworkShareDiscoveryPayload) =>
+  readJson<string[]>("/api/network-drives/discover-shares", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 export const createNetworkDrive = (payload: NetworkDrivePayload) =>
   readJson<NetworkDriveItem>("/api/network-drives", {
     method: "POST",
@@ -162,6 +189,10 @@ export const cloneNetworkDrive = (driveId: number, payload: NetworkDriveClonePay
   });
 export const checkNetworkDrive = (driveId: number) =>
   readJson<NetworkDriveItem>(`/api/network-drives/${driveId}/check`, {
+    method: "POST",
+  });
+export const mountNetworkDrive = (driveId: number) =>
+  readJson<NetworkDriveItem>(`/api/network-drives/${driveId}/mount`, {
     method: "POST",
   });
 export const deleteNetworkDrive = (driveId: number) =>

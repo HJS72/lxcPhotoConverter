@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Alert,
   AppBar,
@@ -41,10 +41,12 @@ import {
   cloneNetworkDrive,
   createWorkflow,
   createNetworkDrive,
+  discoverNetworkDriveShares,
   deleteNetworkDrive,
   deleteWorkflow,
   fetchHistory,
   fetchNetworkDrives,
+  fetchNetworkDriveFolders,
   fetchStatus,
   fetchWorkflows,
   HistoryItem,
@@ -55,6 +57,7 @@ import {
   startScanSchedule,
   stopScanSchedule,
   triggerScan,
+  mountNetworkDrive,
   updateScanInterval,
   updateNetworkDrive,
   updateWorkflow,
@@ -71,6 +74,111 @@ const formatTimestamp = (value: string | null) => {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
 };
 
+type WorkflowPathField = "source_path" | "destination_path" | "failed_path";
+
+type WorkflowPathSelection = {
+  driveId: number | null;
+  subfolder: string;
+};
+
+type WorkflowFolderTreeNode = {
+  name: string;
+  path: string;
+  children: WorkflowFolderTreeNode[];
+};
+
+const workflowPathFieldLabels: Record<WorkflowPathField, string> = {
+  source_path: "Source",
+  destination_path: "Destination",
+  failed_path: "Failed",
+};
+
+const normalizeSubfolder = (value: string) => value.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+
+const composeWorkflowPath = (drive: NetworkDriveItem | null, subfolder: string) => {
+  const normalizedSubfolder = normalizeSubfolder(subfolder);
+  if (drive?.mount_path) {
+    return normalizedSubfolder ? `${drive.mount_path}/${normalizedSubfolder}` : drive.mount_path;
+  }
+  return normalizedSubfolder;
+};
+
+const extractServerFromSmbPath = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("//")) {
+    return "";
+  }
+  const parts = trimmed.slice(2).split("/").filter(Boolean);
+  return parts[0] ?? "";
+};
+
+const resolveWorkflowPathSelection = (path: string, drives: NetworkDriveItem[]): WorkflowPathSelection => {
+  const normalizedPath = path.trim();
+  if (!normalizedPath) {
+    return { driveId: null, subfolder: "" };
+  }
+
+  const match = drives
+    .filter((drive) => {
+      const mountPath = drive.mount_path?.trim();
+      return Boolean(mountPath && (normalizedPath === mountPath || normalizedPath.startsWith(`${mountPath}/`)));
+    })
+    .sort((left, right) => (right.mount_path?.length ?? 0) - (left.mount_path?.length ?? 0))[0];
+
+  if (!match?.mount_path) {
+    return { driveId: null, subfolder: normalizedPath };
+  }
+
+  const subfolder = normalizedPath === match.mount_path ? "" : normalizedPath.slice(match.mount_path.length + 1);
+  return { driveId: match.id, subfolder: normalizeSubfolder(subfolder) };
+};
+
+const sortByName = <T extends { name: string }>(items: T[]) =>
+  [...items].sort((left, right) => left.name.localeCompare(right.name));
+
+const buildWorkflowFolderTree = (folders: string[]): WorkflowFolderTreeNode[] => {
+  type MutableNode = {
+    name: string;
+    path: string;
+    children: Map<string, MutableNode>;
+  };
+
+  const root: MutableNode = { name: "", path: "", children: new Map() };
+
+  for (const rawFolder of folders) {
+    const normalized = normalizeSubfolder(rawFolder);
+    if (!normalized) {
+      continue;
+    }
+
+    let cursor = root;
+    let currentPath = "";
+    for (const segment of normalized.split("/").filter(Boolean)) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      const existing = cursor.children.get(segment);
+      if (existing) {
+        cursor = existing;
+        continue;
+      }
+
+      const created: MutableNode = { name: segment, path: currentPath, children: new Map() };
+      cursor.children.set(segment, created);
+      cursor = created;
+    }
+  }
+
+  const toTree = (nodes: Map<string, MutableNode>): WorkflowFolderTreeNode[] =>
+    [...nodes.values()]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((node) => ({
+        name: node.name,
+        path: node.path,
+        children: toTree(node.children),
+      }));
+
+  return toTree(root.children);
+};
+
 export const App = () => {
   const { theme, mode, toggleMode } = useAppTheme();
   const [tab, setTab] = useState<"dashboard" | "admin">("dashboard");
@@ -85,10 +193,27 @@ export const App = () => {
   const [scanIntervalInput, setScanIntervalInput] = useState("120");
   const [scanIntervalDirty, setScanIntervalDirty] = useState(false);
   const [editingWorkflowId, setEditingWorkflowId] = useState<number | null>(null);
+  const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   const [overwriteConfirmOpen, setOverwriteConfirmOpen] = useState(false);
   const [overwriteTarget, setOverwriteTarget] = useState<WorkflowItem | null>(null);
+  const [workflowPathSelections, setWorkflowPathSelections] = useState<Record<WorkflowPathField, WorkflowPathSelection>>({
+    source_path: { driveId: null, subfolder: "" },
+    destination_path: { driveId: null, subfolder: "" },
+    failed_path: { driveId: null, subfolder: "" },
+  });
+  const [workflowFolderDialogOpen, setWorkflowFolderDialogOpen] = useState(false);
+  const [workflowFolderField, setWorkflowFolderField] = useState<WorkflowPathField | null>(null);
+  const [workflowFolderDriveId, setWorkflowFolderDriveId] = useState<number | null>(null);
+  const [workflowFolderOptions, setWorkflowFolderOptions] = useState<string[]>([]);
+  const [workflowFolderLoading, setWorkflowFolderLoading] = useState(false);
+  const [workflowFolderCache, setWorkflowFolderCache] = useState<Record<number, string[]>>({});
+  const [expandedWorkflowFolderPaths, setExpandedWorkflowFolderPaths] = useState<string[]>([]);
   const [networkDialogOpen, setNetworkDialogOpen] = useState(false);
   const [editingDriveId, setEditingDriveId] = useState<number | null>(null);
+  const [networkShareServer, setNetworkShareServer] = useState("");
+  const [networkShareOptions, setNetworkShareOptions] = useState<string[]>([]);
+  const [networkShareSelected, setNetworkShareSelected] = useState("");
+  const [networkShareLoading, setNetworkShareLoading] = useState(false);
   const [networkDriveForm, setNetworkDriveForm] = useState<NetworkDrivePayload>({
     name: "",
     smb_path: "",
@@ -108,45 +233,7 @@ export const App = () => {
   const [driveOverwriteConfirmOpen, setDriveOverwriteConfirmOpen] = useState(false);
   const [driveOverwriteTarget, setDriveOverwriteTarget] = useState<NetworkDriveItem | null>(null);
 
-  const stats = useMemo(
-    () => [
-      { label: "Queued", value: status?.queued_files ?? 0 },
-      { label: "Workers", value: status?.workers_alive ?? 0 },
-      { label: "Processed", value: status?.total_processed ?? 0 },
-      { label: "Duplicates", value: status?.total_duplicates ?? 0 },
-      { label: "Failed", value: status?.total_failed ?? 0 },
-    ],
-    [status]
-  );
-
-  const workflowPathOptions = useMemo(() => {
-    const options = networkDrives
-      .filter((drive) => Boolean(drive.mount_path && drive.mount_path.trim()))
-      .map((drive) => ({
-        value: (drive.mount_path ?? "").trim(),
-        label: `${drive.name} (${(drive.mount_path ?? "").trim()})`,
-      }));
-
-    const seen = new Set<string>();
-    return options.filter((option) => {
-      if (!option.value || seen.has(option.value)) {
-        return false;
-      }
-      seen.add(option.value);
-      return true;
-    });
-  }, [networkDrives]);
-
-  const ensureCurrentPathOption = (value: string) => {
-    const normalized = value.trim();
-    if (!normalized) {
-      return workflowPathOptions;
-    }
-    if (workflowPathOptions.some((option) => option.value === normalized)) {
-      return workflowPathOptions;
-    }
-    return [{ value: normalized, label: `Custom (${normalized})` }, ...workflowPathOptions];
-  };
+  const workflowFolderTree = useMemo(() => buildWorkflowFolderTree(workflowFolderOptions), [workflowFolderOptions]);
 
   const refreshDashboard = async () => {
     setRefreshing(true);
@@ -166,7 +253,7 @@ export const App = () => {
   const refreshWorkflows = async () => {
     try {
       const items = await fetchWorkflows();
-      setWorkflows(items);
+      setWorkflows(sortByName(items));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Workflow load failed");
     }
@@ -175,7 +262,7 @@ export const App = () => {
   const refreshNetworkDrives = async () => {
     try {
       const items = await fetchNetworkDrives();
-      setNetworkDrives(items);
+      setNetworkDrives(sortByName(items));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Network drive load failed");
     }
@@ -228,8 +315,27 @@ export const App = () => {
     }
   };
 
+  const updateWorkflowPathSelection = (field: WorkflowPathField, driveId: number | null, subfolder: string) => {
+    const normalizedSubfolder = normalizeSubfolder(subfolder);
+    const selectedDrive = networkDrives.find((item) => item.id === driveId) ?? null;
+    setWorkflowPathSelections((prev) => ({
+      ...prev,
+      [field]: { driveId, subfolder: normalizedSubfolder },
+    }));
+    setWorkflowForm((prev) => ({
+      ...prev,
+      [field]: composeWorkflowPath(selectedDrive, normalizedSubfolder),
+    }));
+  };
+
   const resetWorkflowForm = () => {
     setEditingWorkflowId(null);
+    setWorkflowDialogOpen(false);
+    setWorkflowPathSelections({
+      source_path: { driveId: null, subfolder: "" },
+      destination_path: { driveId: null, subfolder: "" },
+      failed_path: { driveId: null, subfolder: "" },
+    });
     setWorkflowForm({
       name: "",
       source_path: "",
@@ -238,6 +344,185 @@ export const App = () => {
       allowed_extensions: "",
       enabled: true,
     });
+  };
+
+  const openCreateWorkflowDialog = () => {
+    setEditingWorkflowId(null);
+    setWorkflowPathSelections({
+      source_path: { driveId: null, subfolder: "" },
+      destination_path: { driveId: null, subfolder: "" },
+      failed_path: { driveId: null, subfolder: "" },
+    });
+    setWorkflowForm({
+      name: "",
+      source_path: "",
+      destination_path: "",
+      failed_path: "",
+      allowed_extensions: "",
+      enabled: true,
+    });
+    setWorkflowDialogOpen(true);
+  };
+
+  const closeWorkflowDialog = () => {
+    setWorkflowDialogOpen(false);
+    setWorkflowFolderDialogOpen(false);
+    setWorkflowFolderField(null);
+    setWorkflowFolderDriveId(null);
+    setWorkflowFolderOptions([]);
+    setWorkflowFolderLoading(false);
+    resetWorkflowForm();
+  };
+
+  const openWorkflowFolderDialog = async (field: WorkflowPathField) => {
+    const driveId = workflowPathSelections[field].driveId;
+    if (driveId === null) {
+      setError(`Choose network first for ${workflowPathFieldLabels[field].toLowerCase()} path.`);
+      return;
+    }
+
+    setWorkflowFolderField(field);
+    setWorkflowFolderDriveId(driveId);
+    setWorkflowFolderDialogOpen(true);
+    setExpandedWorkflowFolderPaths([]);
+
+    const cachedFolders = workflowFolderCache[driveId];
+    if (cachedFolders !== undefined) {
+      setWorkflowFolderOptions(cachedFolders);
+      return;
+    }
+
+    setWorkflowFolderLoading(true);
+    try {
+      const folders: string[] = await fetchNetworkDriveFolders(driveId);
+      const sortedFolders = folders.map((folder: string) => folder.trim()).filter(Boolean).sort((left: string, right: string) => left.localeCompare(right));
+      setWorkflowFolderCache((prev) => ({ ...prev, [driveId]: sortedFolders }));
+      setWorkflowFolderOptions(sortedFolders);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Folder load failed");
+      setWorkflowFolderDialogOpen(false);
+      setWorkflowFolderField(null);
+      setWorkflowFolderDriveId(null);
+    } finally {
+      setWorkflowFolderLoading(false);
+    }
+  };
+
+  const chooseWorkflowFolder = (subfolder: string) => {
+    if (workflowFolderField === null || workflowFolderDriveId === null) {
+      return;
+    }
+    updateWorkflowPathSelection(workflowFolderField, workflowFolderDriveId, subfolder);
+    setWorkflowFolderDialogOpen(false);
+    setWorkflowFolderField(null);
+    setWorkflowFolderDriveId(null);
+    setWorkflowFolderOptions([]);
+    setExpandedWorkflowFolderPaths([]);
+  };
+
+  const handleWorkflowPathInputChange = (field: WorkflowPathField, value: string) => {
+    setWorkflowForm((prev) => ({
+      ...prev,
+      [field]: value,
+    }));
+
+    setWorkflowPathSelections((prev) => ({
+      ...prev,
+      [field]: resolveWorkflowPathSelection(value, networkDrives),
+    }));
+  };
+
+  const toggleWorkflowFolderPath = (path: string) => {
+    setExpandedWorkflowFolderPaths((prev) =>
+      prev.includes(path) ? prev.filter((item) => item !== path) : [...prev, path]
+    );
+  };
+
+  const renderWorkflowFolderTree = (nodes: WorkflowFolderTreeNode[], depth = 0): ReactNode[] => {
+    const activeSubfolder = workflowFolderField ? workflowPathSelections[workflowFolderField].subfolder : "";
+
+    return nodes.flatMap((node) => {
+      const hasChildren = node.children.length > 0;
+      const isExpanded = expandedWorkflowFolderPaths.includes(node.path);
+      const isSelected = activeSubfolder === node.path;
+
+      const row = (
+        <Box key={node.path}>
+          <Stack direction="row" alignItems="center" spacing={1} sx={{ pl: depth * 2 }}>
+            <Button
+              size="small"
+              variant="text"
+              onClick={() => toggleWorkflowFolderPath(node.path)}
+              disabled={!hasChildren}
+              sx={{ minWidth: 26, width: 26, px: 0, fontFamily: "monospace" }}
+            >
+              {hasChildren ? (isExpanded ? "-" : "+") : ""}
+            </Button>
+            <Button
+              size="small"
+              variant={isSelected ? "contained" : "text"}
+              onClick={() => chooseWorkflowFolder(node.path)}
+              sx={{ justifyContent: "flex-start", textTransform: "none", flexGrow: 1 }}
+            >
+              {node.name}
+            </Button>
+          </Stack>
+        </Box>
+      );
+
+      if (!hasChildren || !isExpanded) {
+        return [row];
+      }
+
+      return [row, ...renderWorkflowFolderTree(node.children, depth + 1)];
+    });
+  };
+
+  const renderWorkflowPathPicker = (field: WorkflowPathField) => {
+    const selection = workflowPathSelections[field];
+    const selectedDrive = networkDrives.find((item) => item.id === selection.driveId) ?? null;
+    const driveLabel = selectedDrive?.name ?? "Select network";
+    const currentPath = workflowForm[field] ?? "";
+
+    return (
+      <Stack spacing={1}>
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+          <TextField
+            select
+            label={`${workflowPathFieldLabels[field]} Network`}
+            value={selection.driveId ?? ""}
+            onChange={(event) => {
+              const nextDriveId = event.target.value === "" ? null : Number(event.target.value);
+              updateWorkflowPathSelection(field, nextDriveId, "");
+            }}
+            sx={{ minWidth: 260 }}
+          >
+            <MenuItem value="">Select network</MenuItem>
+            {networkDrives.map((drive) => (
+              <MenuItem key={drive.id} value={drive.id}>
+                {drive.name}
+              </MenuItem>
+            ))}
+          </TextField>
+          <Button variant="outlined" onClick={() => void openWorkflowFolderDialog(field)} disabled={selection.driveId === null}>
+            Choose Subfolder
+          </Button>
+        </Stack>
+        <TextField
+          label={`${workflowPathFieldLabels[field]} Path`}
+          value={currentPath}
+          onChange={(event) => handleWorkflowPathInputChange(field, event.target.value)}
+          fullWidth
+        />
+        <Typography variant="caption" color="text.secondary">
+          {selection.driveId === null
+            ? "No network selected."
+            : selection.subfolder
+              ? `${driveLabel} / ${selection.subfolder}`
+              : `${driveLabel} / root`}
+        </Typography>
+      </Stack>
+    );
   };
 
   const submitWorkflow = async () => {
@@ -265,6 +550,7 @@ export const App = () => {
       await refreshWorkflows();
       await refreshDashboard();
       resetWorkflowForm();
+      setWorkflowDialogOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Workflow save failed");
     }
@@ -285,6 +571,7 @@ export const App = () => {
       setOverwriteConfirmOpen(false);
       setOverwriteTarget(null);
       resetWorkflowForm();
+      setWorkflowDialogOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Workflow overwrite failed");
     }
@@ -297,6 +584,7 @@ export const App = () => {
       await refreshDashboard();
       setNotice("Workflow created (Save As).");
       resetWorkflowForm();
+      setWorkflowDialogOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Workflow Save As failed");
     }
@@ -304,6 +592,11 @@ export const App = () => {
 
   const startEditWorkflow = (item: WorkflowItem) => {
     setEditingWorkflowId(item.id);
+    setWorkflowPathSelections({
+      source_path: resolveWorkflowPathSelection(item.source_path, networkDrives),
+      destination_path: resolveWorkflowPathSelection(item.destination_path, networkDrives),
+      failed_path: resolveWorkflowPathSelection(item.failed_path, networkDrives),
+    });
     setWorkflowForm({
       name: item.name,
       source_path: item.source_path,
@@ -312,6 +605,7 @@ export const App = () => {
       allowed_extensions: item.allowed_extensions ?? "",
       enabled: item.enabled,
     });
+    setWorkflowDialogOpen(true);
   };
 
   const removeWorkflow = async (workflowId: number) => {
@@ -329,6 +623,10 @@ export const App = () => {
 
   const resetDriveForm = () => {
     setEditingDriveId(null);
+    setNetworkShareServer("");
+    setNetworkShareOptions([]);
+    setNetworkShareSelected("");
+    setNetworkShareLoading(false);
     setNetworkDriveForm({
       name: "",
       smb_path: "",
@@ -351,6 +649,10 @@ export const App = () => {
 
   const openEditDriveDialog = (drive: NetworkDriveItem) => {
     setEditingDriveId(drive.id);
+    setNetworkShareServer(extractServerFromSmbPath(drive.smb_path));
+    setNetworkShareOptions([]);
+    setNetworkShareSelected("");
+    setNetworkShareLoading(false);
     setNetworkDriveForm({
       name: drive.name,
       smb_path: drive.smb_path,
@@ -360,6 +662,50 @@ export const App = () => {
       enabled: drive.enabled,
     });
     setNetworkDialogOpen(true);
+  };
+
+  const discoverShares = async () => {
+    if (!networkShareServer.trim()) {
+      setError("Enter server address first to discover shares.");
+      return;
+    }
+    if (!networkDriveForm.username.trim()) {
+      setError("Enter username first to discover shares.");
+      return;
+    }
+    if (!networkDriveForm.password.trim()) {
+      setError("Enter password first to discover shares.");
+      return;
+    }
+
+    try {
+      setNetworkShareLoading(true);
+      const shares = await discoverNetworkDriveShares({
+        server: networkShareServer.trim(),
+        username: networkDriveForm.username.trim(),
+        password: networkDriveForm.password,
+      });
+      setNetworkShareOptions(shares);
+      setNetworkShareSelected(shares[0] ?? "");
+      setNotice(shares.length > 0 ? `Found ${shares.length} shares.` : "No shares found.");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Share discovery failed");
+    } finally {
+      setNetworkShareLoading(false);
+    }
+  };
+
+  const applySelectedShare = () => {
+    if (!networkShareServer.trim() || !networkShareSelected) {
+      return;
+    }
+    setNetworkDriveForm((prev) => ({
+      ...prev,
+      smb_path: `//${networkShareServer.trim()}/${networkShareSelected}`,
+    }));
+    setNotice(`SMB Path set to //${networkShareServer.trim()}/${networkShareSelected}`);
+    setError(null);
   };
 
   const submitDrive = async () => {
@@ -457,6 +803,17 @@ export const App = () => {
     }
   };
 
+  const mountDrive = async (driveId: number) => {
+    try {
+      await mountNetworkDrive(driveId);
+      await refreshNetworkDrives();
+      setError(null);
+      setNotice("Network drive mounted.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Mount failed");
+    }
+  };
+
   useEffect(() => {
     void Promise.all([refreshDashboard(), refreshWorkflows(), refreshNetworkDrives()]);
     const timer = setInterval(() => {
@@ -548,182 +905,12 @@ export const App = () => {
           ) : tab === "admin" ? (
             <Stack spacing={3}>
               <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
-                <Typography variant="h6" sx={{ mb: 2 }}>
-                  {editingWorkflowId === null ? "Create Workflow" : `Edit Workflow #${editingWorkflowId}`}
-                </Typography>
-                <Stack spacing={2}>
-                  <TextField
-                    label="Workflow Name"
-                    value={workflowForm.name}
-                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, name: event.target.value }))}
-                    fullWidth
-                  />
-                  <TextField
-                    label="Source Path"
-                    select
-                    value={workflowForm.source_path}
-                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, source_path: event.target.value }))}
-                    helperText="Choose configured network drive mount path"
-                    fullWidth
-                  >
-                    <MenuItem value="">Select source path</MenuItem>
-                    {ensureCurrentPathOption(workflowForm.source_path).map((option) => (
-                      <MenuItem key={`source-${option.value}`} value={option.value}>
-                        {option.label}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                  <TextField
-                    label="Destination Path"
-                    select
-                    value={workflowForm.destination_path}
-                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, destination_path: event.target.value }))}
-                    helperText="Choose configured network drive mount path"
-                    fullWidth
-                  >
-                    <MenuItem value="">Select destination path</MenuItem>
-                    {ensureCurrentPathOption(workflowForm.destination_path).map((option) => (
-                      <MenuItem key={`destination-${option.value}`} value={option.value}>
-                        {option.label}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                  <TextField
-                    label="Failed Path"
-                    select
-                    value={workflowForm.failed_path}
-                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, failed_path: event.target.value }))}
-                    helperText="Choose configured network drive mount path"
-                    fullWidth
-                  >
-                    <MenuItem value="">Select failed path</MenuItem>
-                    {ensureCurrentPathOption(workflowForm.failed_path).map((option) => (
-                      <MenuItem key={`failed-${option.value}`} value={option.value}>
-                        {option.label}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                  <TextField
-                    label="Filetypes (comma-separated, optional)"
-                    value={workflowForm.allowed_extensions}
-                    onChange={(event) =>
-                      setWorkflowForm((prev) => ({ ...prev, allowed_extensions: event.target.value }))
-                    }
-                    placeholder=".jpg,.jpeg,.heic,.mp4"
-                    fullWidth
-                  />
-                  <Typography variant="body2" color="text.secondary">
-                    Filename pattern is fixed: IMG_YYYYMMDD_HHMMSS.ext
-                  </Typography>
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={workflowForm.enabled}
-                        onChange={(event) =>
-                          setWorkflowForm((prev) => ({ ...prev, enabled: event.target.checked }))
-                        }
-                      />
-                    }
-                    label="Enabled"
-                  />
-                  <Stack direction="row" spacing={1}>
-                    <Button
-                      variant="contained"
-                      onClick={submitWorkflow}
-                      disabled={
-                        !workflowForm.name.trim() ||
-                        !workflowForm.source_path.trim() ||
-                        !workflowForm.destination_path.trim() ||
-                        !workflowForm.failed_path.trim()
-                      }
-                    >
-                      {editingWorkflowId === null ? "Create" : "Save"}
-                    </Button>
-                    {editingWorkflowId !== null && (
-                      <Button
-                        variant="outlined"
-                        onClick={saveWorkflowAsNew}
-                        disabled={
-                          !workflowForm.name.trim() ||
-                          !workflowForm.source_path.trim() ||
-                          !workflowForm.destination_path.trim() ||
-                          !workflowForm.failed_path.trim()
-                        }
-                      >
-                        Save As
-                      </Button>
-                    )}
-                    <Button variant="outlined" onClick={resetWorkflowForm}>
-                      Clear
-                    </Button>
-                  </Stack>
-                </Stack>
-              </Paper>
-
-              <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
                 <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                  <Typography variant="h6">Network Drives</Typography>
-                  <Button variant="contained" onClick={openCreateDriveDialog}>Add Network Drive</Button>
+                  <Typography variant="h6">Workflows</Typography>
+                  <Button variant="contained" onClick={openCreateWorkflowDialog}>
+                    Add Workflow
+                  </Button>
                 </Stack>
-                <TableContainer sx={{ mb: 2 }}>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Name</TableCell>
-                        <TableCell>SMB Path</TableCell>
-                        <TableCell>Mount Path</TableCell>
-                        <TableCell>User</TableCell>
-                        <TableCell>Status</TableCell>
-                        <TableCell align="right">Actions</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {networkDrives.map((drive) => (
-                        <TableRow key={drive.id} hover>
-                          <TableCell>{drive.name}</TableCell>
-                          <TableCell sx={{ maxWidth: 180, wordBreak: "break-all" }}>{drive.smb_path}</TableCell>
-                          <TableCell sx={{ maxWidth: 180, wordBreak: "break-all" }}>{drive.mount_path ?? "-"}</TableCell>
-                          <TableCell>{drive.username}</TableCell>
-                          <TableCell>
-                            <Stack spacing={0.5}>
-                              <Chip
-                                size="small"
-                                label={drive.connection_status}
-                                color={
-                                  drive.connection_status === "connected"
-                                    ? "success"
-                                    : drive.connection_status === "partial"
-                                      ? "warning"
-                                      : drive.connection_status === "auth_failed" || drive.connection_status === "offline"
-                                        ? "error"
-                                        : "default"
-                                }
-                              />
-                              {drive.last_error && (
-                                <Typography variant="caption" color="text.secondary" sx={{ maxWidth: 220, wordBreak: "break-word" }}>
-                                  {drive.last_error}
-                                </Typography>
-                              )}
-                            </Stack>
-                          </TableCell>
-                          <TableCell align="right">
-                            <Stack direction="row" spacing={1} justifyContent="flex-end">
-                              <Button size="small" onClick={() => checkDrive(drive.id)}>Check</Button>
-                              <Button size="small" onClick={() => openEditDriveDialog(drive)}>Edit</Button>
-                              <Button size="small" color="error" onClick={() => removeDrive(drive.id)}>Delete</Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-                <Typography variant="h6" sx={{ mb: 1 }}>
-                  Workflow Routing
-                </Typography>
-                <Typography variant="h6" sx={{ mb: 1 }}>
-                  Configured Workflows
-                </Typography>
                 <TableContainer>
                   <Table size="small">
                     <TableHead>
@@ -765,6 +952,69 @@ export const App = () => {
                 </TableContainer>
               </Paper>
 
+              <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
+                <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                  <Typography variant="h6">Network Drives</Typography>
+                  <Button variant="contained" onClick={openCreateDriveDialog}>Add Network Drive</Button>
+                </Stack>
+                <TableContainer sx={{ mb: 2 }}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Name</TableCell>
+                        <TableCell>SMB Path</TableCell>
+                        <TableCell>Mount Path</TableCell>
+                        <TableCell>User</TableCell>
+                        <TableCell>Status</TableCell>
+                        <TableCell align="right">Actions</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {networkDrives.map((drive) => (
+                        <TableRow key={drive.id} hover>
+                          <TableCell>{drive.name}</TableCell>
+                          <TableCell sx={{ maxWidth: 180, wordBreak: "break-all" }}>{drive.smb_path}</TableCell>
+                          <TableCell sx={{ maxWidth: 180, wordBreak: "break-all" }}>{drive.mount_path ?? "-"}</TableCell>
+                          <TableCell>{drive.username}</TableCell>
+                          <TableCell>
+                            <Stack spacing={0.5}>
+                              <Chip
+                                size="small"
+                                label={drive.connection_status}
+                                color={
+                                  drive.connection_status === "connected"
+                                    ? "success"
+                                    : drive.connection_status === "partial"
+                                      ? "warning"
+                                      : drive.connection_status === "mount_unavailable" || drive.connection_status === "read_only"
+                                        ? "warning"
+                                        : drive.connection_status === "auth_failed" || drive.connection_status === "offline"
+                                        ? "error"
+                                        : "default"
+                                }
+                              />
+                              {drive.last_error && (
+                                <Typography variant="caption" color="text.secondary" sx={{ maxWidth: 220, wordBreak: "break-word" }}>
+                                  {drive.last_error}
+                                </Typography>
+                              )}
+                            </Stack>
+                          </TableCell>
+                          <TableCell align="right">
+                            <Stack direction="row" spacing={1} justifyContent="flex-end">
+                              <Button size="small" onClick={() => mountDrive(drive.id)}>Mount</Button>
+                              <Button size="small" onClick={() => checkDrive(drive.id)}>Check</Button>
+                              <Button size="small" onClick={() => openEditDriveDialog(drive)}>Edit</Button>
+                              <Button size="small" color="error" onClick={() => removeDrive(drive.id)}>Delete</Button>
+                            </Stack>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Paper>
+
               <Dialog open={networkDialogOpen} onClose={closeDriveDialog} fullWidth maxWidth="sm">
                 <DialogTitle>{editingDriveId === null ? "Add Network Drive" : `Edit Network Drive #${editingDriveId}`}</DialogTitle>
                 <DialogContent>
@@ -776,10 +1026,50 @@ export const App = () => {
                       fullWidth
                     />
                     <TextField
+                      label="Server (for share discovery)"
+                      placeholder="10.13.20.1"
+                      value={networkShareServer}
+                      onChange={(event) => setNetworkShareServer(event.target.value)}
+                      fullWidth
+                    />
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems="center">
+                      <Button variant="outlined" onClick={discoverShares} disabled={networkShareLoading}>
+                        {networkShareLoading ? "Discovering..." : "Discover Shares"}
+                      </Button>
+                      {networkShareLoading && <CircularProgress size={20} />}
+                    </Stack>
+                    {networkShareOptions.length > 0 && (
+                      <>
+                        <TextField
+                          select
+                          label="Available Shares"
+                          value={networkShareSelected}
+                          onChange={(event) => setNetworkShareSelected(event.target.value)}
+                          fullWidth
+                        >
+                          {networkShareOptions.map((share) => (
+                            <MenuItem key={share} value={share}>
+                              {share}
+                            </MenuItem>
+                          ))}
+                        </TextField>
+                        <Button variant="outlined" onClick={applySelectedShare} disabled={!networkShareSelected}>
+                          Use Selected Share
+                        </Button>
+                      </>
+                    )}
+                    <TextField
                       label="SMB Path"
                       placeholder="//server/share"
                       value={networkDriveForm.smb_path}
-                      onChange={(event) => setNetworkDriveForm((prev) => ({ ...prev, smb_path: event.target.value }))}
+                      onChange={(event) => {
+                        const nextValue = event.target.value;
+                        setNetworkDriveForm((prev) => ({ ...prev, smb_path: nextValue }));
+                        const parsedServer = extractServerFromSmbPath(nextValue);
+                        if (parsedServer) {
+                          setNetworkShareServer(parsedServer);
+                        }
+                      }}
                       fullWidth
                     />
                     <TextField
@@ -842,6 +1132,119 @@ export const App = () => {
                     }
                   >
                     {editingDriveId === null ? "Create" : "Save"}
+                  </Button>
+                </DialogActions>
+              </Dialog>
+
+              <Dialog open={workflowDialogOpen} onClose={closeWorkflowDialog} fullWidth maxWidth="md">
+                <DialogTitle>{editingWorkflowId === null ? "Add Workflow" : `Edit Workflow #${editingWorkflowId}`}</DialogTitle>
+                <DialogContent>
+                  <Stack spacing={2} sx={{ mt: 1 }}>
+                    <TextField
+                      label="Workflow Name"
+                      value={workflowForm.name}
+                      onChange={(event) => setWorkflowForm((prev) => ({ ...prev, name: event.target.value }))}
+                      fullWidth
+                    />
+                    {renderWorkflowPathPicker("source_path")}
+                    {renderWorkflowPathPicker("destination_path")}
+                    {renderWorkflowPathPicker("failed_path")}
+                    <TextField
+                      label="Filetypes (comma-separated, optional)"
+                      value={workflowForm.allowed_extensions}
+                      onChange={(event) =>
+                        setWorkflowForm((prev) => ({ ...prev, allowed_extensions: event.target.value }))
+                      }
+                      placeholder=".jpg,.jpeg,.heic,.mp4"
+                      fullWidth
+                    />
+                    <Typography variant="body2" color="text.secondary">
+                      Filename pattern is fixed: IMG_YYYYMMDD_HHMMSS.ext
+                    </Typography>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={workflowForm.enabled}
+                          onChange={(event) =>
+                            setWorkflowForm((prev) => ({ ...prev, enabled: event.target.checked }))
+                          }
+                        />
+                      }
+                      label="Enabled"
+                    />
+                  </Stack>
+                </DialogContent>
+                <DialogActions>
+                  <Button onClick={closeWorkflowDialog}>Cancel</Button>
+                  {editingWorkflowId !== null && (
+                    <Button variant="outlined" onClick={saveWorkflowAsNew} disabled={!workflowForm.name.trim()}>
+                      Save As
+                    </Button>
+                  )}
+                  <Button
+                    variant="contained"
+                    onClick={submitWorkflow}
+                    disabled={
+                      !workflowForm.name.trim() ||
+                      !workflowForm.source_path.trim() ||
+                      !workflowForm.destination_path.trim() ||
+                      !workflowForm.failed_path.trim()
+                    }
+                  >
+                    {editingWorkflowId === null ? "Create" : "Save"}
+                  </Button>
+                </DialogActions>
+              </Dialog>
+
+              <Dialog
+                open={workflowFolderDialogOpen}
+                onClose={() => {
+                  setWorkflowFolderDialogOpen(false);
+                  setWorkflowFolderField(null);
+                  setWorkflowFolderDriveId(null);
+                  setWorkflowFolderOptions([]);
+                  setWorkflowFolderLoading(false);
+                  setExpandedWorkflowFolderPaths([]);
+                }}
+                fullWidth
+                maxWidth="sm"
+              >
+                <DialogTitle>Choose Subfolder</DialogTitle>
+                <DialogContent>
+                  <Stack spacing={2} sx={{ mt: 1 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      {workflowFolderDriveId === null
+                        ? "Select network first."
+                        : `Pick folder for ${workflowPathFieldLabels[workflowFolderField ?? "source_path"]}`}
+                    </Typography>
+                    <Button variant="outlined" onClick={() => chooseWorkflowFolder("")}>Use drive root</Button>
+                    {workflowFolderLoading ? (
+                      <Box sx={{ display: "grid", placeItems: "center", py: 3 }}>
+                        <CircularProgress size={24} />
+                      </Box>
+                    ) : (
+                      <Box sx={{ maxHeight: 420, overflowY: "auto", border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
+                        {workflowFolderTree.length > 0 ? (
+                          <Stack spacing={0.5}>{renderWorkflowFolderTree(workflowFolderTree)}</Stack>
+                        ) : (
+                          <Typography variant="body2" color="text.secondary">No subfolders found.</Typography>
+                        )}
+                      </Box>
+                    )}
+                  </Stack>
+                </DialogContent>
+                <DialogActions>
+                  <Button
+                    onClick={() => {
+                      setWorkflowFolderDialogOpen(false);
+                      setWorkflowFolderField(null);
+                      setWorkflowFolderDriveId(null);
+                      setWorkflowFolderOptions([]);
+                      setWorkflowFolderLoading(false);
+                      setExpandedWorkflowFolderPaths([]);
+                    }}
+                  >
+                    Cancel
                   </Button>
                 </DialogActions>
               </Dialog>
@@ -954,36 +1357,50 @@ export const App = () => {
                 </Stack>
               </Paper>
 
-              <Box
-                sx={{
-                  display: "grid",
-                  gap: 2,
-                  gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
-                }}
-              >
-                {stats.map((item) => (
-                  <Paper
-                    key={item.label}
-                    sx={{
-                      p: 2,
-                      border: "1px solid",
-                      borderColor: "divider",
-                      backdropFilter: "blur(8px)",
-                    }}
-                  >
-                    <Typography variant="body2" color="text.secondary">
-                      {item.label}
-                    </Typography>
-                    <Typography variant="h5" sx={{ fontWeight: 700 }}>
-                      {item.value}
-                    </Typography>
-                  </Paper>
-                ))}
-              </Box>
-
-              <Typography variant="body2" color="text.secondary">
-                Workers = number of active background processor threads consuming queued files.
-              </Typography>
+              <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
+                <Typography variant="h6" sx={{ mb: 1 }}>
+                  Workflow Input Folders
+                </Typography>
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Workflow</TableCell>
+                        <TableCell>Source Folder</TableCell>
+                        <TableCell align="right">Files</TableCell>
+                        <TableCell align="right">Queued</TableCell>
+                        <TableCell align="right">Processed</TableCell>
+                        <TableCell align="right">Failed</TableCell>
+                        <TableCell align="right">Duplicates</TableCell>
+                        <TableCell>Status</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {(status?.workflow_sources ?? []).map((item) => (
+                        <TableRow key={item.workflow_id} hover>
+                          <TableCell>{item.workflow_name}</TableCell>
+                          <TableCell sx={{ maxWidth: 260, wordBreak: "break-all" }}>{item.source_path}</TableCell>
+                          <TableCell align="right">{item.files_total}</TableCell>
+                          <TableCell align="right">{item.queued_files}</TableCell>
+                          <TableCell align="right">{item.processed_files}</TableCell>
+                          <TableCell align="right">{item.failed_files}</TableCell>
+                          <TableCell align="right">{item.duplicate_files}</TableCell>
+                          <TableCell>
+                            <Chip size="small" color={item.enabled ? "success" : "default"} label={item.enabled ? "enabled" : "disabled"} />
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                      {(status?.workflow_sources ?? []).length === 0 && (
+                        <TableRow>
+                          <TableCell colSpan={8} sx={{ color: "text.secondary" }}>
+                            No workflows configured.
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Paper>
 
               <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
                 <Typography variant="h6" sx={{ mb: 1 }}>
@@ -997,6 +1414,7 @@ export const App = () => {
                         <TableCell>Source</TableCell>
                         <TableCell>Destination</TableCell>
                         <TableCell>Status</TableCell>
+                        <TableCell>Reason</TableCell>
                       </TableRow>
                     </TableHead>
                     <TableBody>
@@ -1021,6 +1439,9 @@ export const App = () => {
                                       : "default"
                               }
                             />
+                          </TableCell>
+                          <TableCell sx={{ maxWidth: 320, wordBreak: "break-word" }}>
+                            {row.error_message?.trim() || "-"}
                           </TableCell>
                         </TableRow>
                       ))}

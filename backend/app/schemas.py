@@ -18,6 +18,19 @@ class StatusResponse(BaseModel):
     last_scan_trigger: str | None
     scan_interval_seconds: int
     scan_schedule_enabled: bool
+    workflow_sources: list["WorkflowSourceStatusItem"]
+
+
+class WorkflowSourceStatusItem(BaseModel):
+    workflow_id: int
+    workflow_name: str
+    source_path: str
+    enabled: bool
+    files_total: int
+    queued_files: int
+    processed_files: int
+    failed_files: int
+    duplicate_files: int
 
 
 class HistoryItem(BaseModel):
@@ -106,6 +119,12 @@ class NetworkDriveClone(BaseModel):
     username: str = Field(min_length=1, max_length=256)
     password: str | None = Field(default=None, max_length=512)
     enabled: bool = True
+
+
+class NetworkShareDiscoveryRequest(BaseModel):
+    server: str = Field(min_length=1, max_length=255)
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=512)
 
 
 class NetworkDriveItem(BaseModel):

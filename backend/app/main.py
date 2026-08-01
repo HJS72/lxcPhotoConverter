@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,7 +57,14 @@ def on_startup() -> None:
     processor.start()
     watcher.start(settings.source_shares, recursive=settings.observer_recursive)
     scheduler.start()
-    scheduler.enqueue_full_scan()
+
+    def run_initial_scan() -> None:
+        try:
+            scheduler.enqueue_full_scan(trigger="startup")
+        except Exception:
+            logger.exception("Initial full scan failed", extra={"status": "failed"})
+
+    threading.Thread(target=run_initial_scan, name="initial-full-scan", daemon=True).start()
     logger.info("Service started", extra={"status": "started"})
 
 

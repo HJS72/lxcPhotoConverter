@@ -14,7 +14,7 @@ fi
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  python3 python3-venv python3-pip exiftool imagemagick libheif1 cifs-utils smbclient nodejs npm rsync ca-certificates curl
+  python3 python3-venv python3-pip exiftool imagemagick libheif1 cifs-utils smbclient nodejs npm rsync ca-certificates curl sudo
 
 PYTHON_BIN="python3"
 PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
@@ -64,6 +64,12 @@ cp "${PROJECT_ROOT}/deploy/systemd/lxc-photo-converter.service" /etc/systemd/sys
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${PROJECT_ROOT}"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" /srv/import /srv/export /srv/failed
 chmod +x "${PROJECT_ROOT}/scripts/install_debian.sh"
+chmod +x "${PROJECT_ROOT}/scripts/mount_network_drive.sh"
+
+cat >/etc/sudoers.d/lxc-photo-converter-mount <<'SUDOERS'
+photoimport ALL=(root) NOPASSWD: /opt/lxc-photo-converter/scripts/mount_network_drive.sh
+SUDOERS
+chmod 440 /etc/sudoers.d/lxc-photo-converter-mount
 
 systemctl daemon-reload
 systemctl enable --now lxc-photo-converter.service
