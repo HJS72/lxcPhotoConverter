@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-required_cmds=(python3.12 exiftool magick systemctl)
+required_cmds=(python3 exiftool magick systemctl)
 required_paths=(/srv/import/share1 /srv/import/share2 /srv/export /srv/failed)
 
 echo "Checking required commands..."
@@ -12,6 +12,12 @@ for cmd in "${required_cmds[@]}"; do
   fi
   echo "OK: ${cmd}"
 done
+
+python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' || {
+  echo "Python version too old. Need >= 3.12"
+  exit 1
+}
+echo "OK: python >= 3.12"
 
 echo "Checking required paths..."
 for path in "${required_paths[@]}"; do

@@ -4,7 +4,7 @@ Production-ready media import and conversion service for Debian Linux in Proxmox
 
 ## Features
 
-- FastAPI backend on Python 3.12
+- FastAPI backend on Python 3.12+
 - React + TypeScript + Vite + Material UI dashboard
 - SQLite processing history via SQLAlchemy
 - Background worker queue + APScheduler full scans

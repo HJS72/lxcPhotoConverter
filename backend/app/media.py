@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from app.config import Settings
 from app.db import SessionLocal
 from app.exif import extract_capture_time, read_metadata
-from app.models import ProcessedMedia
+from app.models import ProcessedMedia, Workflow
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,12 @@ HEIC_EXTENSIONS = {".heic", ".heif"}
 class QueueStats:
     queued_files: int
     workers_alive: int
+
+
+@dataclass
+class WorkflowTarget:
+    destination_path: Path
+    failed_path: Path
 
 
 class MediaProcessor:
@@ -118,11 +124,14 @@ class MediaProcessor:
 
         source_hash = self._sha256(source_path)
         extension = source_path.suffix.lower()
+        target = self._resolve_target_for_source(source_path)
+        target.destination_path.mkdir(parents=True, exist_ok=True)
+        target.failed_path.mkdir(parents=True, exist_ok=True)
 
         with SessionLocal() as session:
             existing = session.scalar(select(ProcessedMedia).where(ProcessedMedia.source_hash == source_hash))
             if existing:
-                duplicate_path = self._build_failed_destination(source_path, "duplicates")
+                duplicate_path = self._build_failed_destination(source_path, target.failed_path, "duplicates")
                 duplicate_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(source_path), str(duplicate_path))
                 logger.info("Duplicate file skipped", extra={"source_path": str(source_path), "status": "duplicate"})
@@ -150,7 +159,7 @@ class MediaProcessor:
                 work_path = converted_path
                 extension = ".jpg"
 
-            destination_path = self._build_unique_destination(captured_at, extension)
+            destination_path = self._build_unique_destination(captured_at, extension, target.destination_path)
             destination_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(work_path), str(destination_path))
             if converted_path is not None and source_path.exists():
@@ -178,7 +187,7 @@ class MediaProcessor:
                 },
             )
         except Exception as exc:
-            fail_path = self._build_failed_destination(source_path)
+            fail_path = self._build_failed_destination(source_path, target.failed_path)
             fail_path.parent.mkdir(parents=True, exist_ok=True)
             if source_path.exists():
                 shutil.move(str(source_path), str(fail_path))
@@ -199,8 +208,33 @@ class MediaProcessor:
 
             logger.exception("File processing failed", extra={"source_path": str(source_path), "status": "failed"})
 
-    def _build_failed_destination(self, source_path: Path, subfolder: str = "") -> Path:
-        root = self.settings.failed_share
+    def _resolve_target_for_source(self, source_path: Path) -> WorkflowTarget:
+        selected: Workflow | None = None
+        source_text = str(source_path)
+        with SessionLocal() as session:
+            workflows = session.scalars(select(Workflow).where(Workflow.enabled.is_(True))).all()
+
+        for workflow in workflows:
+            root = workflow.source_path.rstrip("/")
+            if not root:
+                continue
+            if source_text == root or source_text.startswith(f"{root}/"):
+                if selected is None or len(workflow.source_path) > len(selected.source_path):
+                    selected = workflow
+
+        if selected is not None:
+            return WorkflowTarget(
+                destination_path=Path(selected.destination_path),
+                failed_path=Path(selected.failed_path),
+            )
+
+        return WorkflowTarget(
+            destination_path=self.settings.destination_share,
+            failed_path=self.settings.failed_share,
+        )
+
+    def _build_failed_destination(self, source_path: Path, failed_root: Path, subfolder: str = "") -> Path:
+        root = failed_root
         if subfolder:
             root = root / subfolder
         candidate = root / source_path.name
@@ -242,16 +276,16 @@ class MediaProcessor:
 
         return temp_path
 
-    def _build_unique_destination(self, captured_at: datetime, extension: str) -> Path:
+    def _build_unique_destination(self, captured_at: datetime, extension: str, destination_root: Path) -> Path:
         base_name = f"IMG_{captured_at.strftime('%Y%m%d_%H%M%S')}"
-        candidate = self.settings.destination_share / f"{base_name}{extension}"
+        candidate = destination_root / f"{base_name}{extension}"
         if not candidate.exists():
             return candidate
 
         counter = 1
         while True:
             suffix = f"_{counter:02d}"
-            candidate = self.settings.destination_share / f"{base_name}{suffix}{extension}"
+            candidate = destination_root / f"{base_name}{suffix}{extension}"
             if not candidate.exists():
                 return candidate
             counter += 1

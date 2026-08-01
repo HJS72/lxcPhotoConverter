@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +13,7 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
     database_url: str = "sqlite:///./data/app.db"
     log_level: str = "INFO"
-    source_shares: list[Path] = Field(default_factory=lambda: [Path("/srv/import/share1"), Path("/srv/import/share2")])
+    source_shares: list[Path] | str = Field(default_factory=lambda: [Path("/srv/import/share1"), Path("/srv/import/share2")])
     destination_share: Path = Path("/srv/export")
     failed_share: Path = Path("/srv/failed")
     scan_interval_seconds: int = 120
@@ -33,10 +34,17 @@ class Settings(BaseSettings):
     @classmethod
     def parse_source_shares(cls, value: object) -> list[Path]:
         if isinstance(value, str):
+            if value.strip().startswith("["):
+                try:
+                    parsed = json.loads(value)
+                    if isinstance(parsed, list):
+                        return [Path(str(item)) for item in parsed]
+                except json.JSONDecodeError:
+                    pass
             items = [item.strip() for item in value.split(",") if item.strip()]
             return [Path(item) for item in items]
         if isinstance(value, list):
-            return [Path(item) for item in value]
+            return [Path(str(item)) for item in value]
         return [Path("/srv/import/share1"), Path("/srv/import/share2")]
 
 

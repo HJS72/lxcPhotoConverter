@@ -25,3 +25,20 @@ class ProcessedMedia(Base):
         default=lambda: datetime.now(UTC).replace(tzinfo=None),
         onupdate=lambda: datetime.now(UTC).replace(tzinfo=None),
     )
+
+
+class Workflow(Base):
+    __tablename__ = "workflows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    source_path: Mapped[str] = mapped_column(String(1024), unique=True, index=True)
+    destination_path: Mapped[str] = mapped_column(String(1024))
+    failed_path: Mapped[str] = mapped_column(String(1024))
+    enabled: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=lambda: datetime.now(UTC).replace(tzinfo=None))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        default=lambda: datetime.now(UTC).replace(tzinfo=None),
+        onupdate=lambda: datetime.now(UTC).replace(tzinfo=None),
+    )

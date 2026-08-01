@@ -14,17 +14,18 @@ fi
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  python3-pip exiftool imagemagick libheif1 cifs-utils nodejs npm rsync ca-certificates
+  python3 python3-venv python3-pip exiftool imagemagick libheif1 cifs-utils nodejs npm rsync ca-certificates curl
 
-if ! command -v python3.12 >/dev/null 2>&1; then
-  apt-get install -y --no-install-recommends python3.12 python3.12-venv || true
-fi
+PYTHON_BIN="python3"
+PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
 
-if ! command -v python3.12 >/dev/null 2>&1; then
-  echo "python3.12 not available in current apt sources"
-  echo "Enable repository providing Python 3.12, then rerun installer"
+if ! ${PYTHON_BIN} -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)'; then
+  echo "Detected Python ${PYTHON_VERSION}, need >= 3.12"
+  echo "Use Debian release/repo with Python >= 3.12, then rerun installer"
   exit 1
 fi
+
+echo "Using ${PYTHON_BIN} version ${PYTHON_VERSION}"
 
 if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
@@ -42,7 +43,10 @@ rsync -a --delete "${SOURCE_ROOT}/frontend/" "${PROJECT_ROOT}/frontend/"
 rsync -a --delete "${SOURCE_ROOT}/deploy/" "${PROJECT_ROOT}/deploy/"
 rsync -a --delete "${SOURCE_ROOT}/scripts/" "${PROJECT_ROOT}/scripts/"
 
-python3.12 -m venv "${PROJECT_ROOT}/.venv"
+# rsync --delete may remove runtime folders not tracked in git.
+mkdir -p "${PROJECT_ROOT}/backend/data"
+
+${PYTHON_BIN} -m venv "${PROJECT_ROOT}/.venv"
 "${PROJECT_ROOT}/.venv/bin/pip" install --upgrade pip
 "${PROJECT_ROOT}/.venv/bin/pip" install -r "${PROJECT_ROOT}/backend/requirements.txt"
 

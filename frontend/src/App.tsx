@@ -8,15 +8,20 @@ import {
   CircularProgress,
   Container,
   CssBaseline,
+  FormControlLabel,
   IconButton,
   Paper,
   Stack,
+  Switch,
+  Tab,
+  Tabs,
   Table,
   TableBody,
   TableCell,
   TableContainer,
   TableHead,
   TableRow,
+  TextField,
   Toolbar,
   Typography,
 } from "@mui/material";
@@ -25,7 +30,19 @@ import LightModeRoundedIcon from "@mui/icons-material/LightModeRounded";
 import AutorenewRoundedIcon from "@mui/icons-material/AutorenewRounded";
 import { ThemeProvider } from "@mui/material/styles";
 
-import { fetchHistory, fetchStatus, HistoryItem, StatusResponse, triggerScan } from "./api";
+import {
+  createWorkflow,
+  deleteWorkflow,
+  fetchHistory,
+  fetchStatus,
+  fetchWorkflows,
+  HistoryItem,
+  StatusResponse,
+  triggerScan,
+  updateWorkflow,
+  WorkflowItem,
+  WorkflowPayload,
+} from "./api";
 import { useAppTheme } from "./theme";
 
 const formatTimestamp = (value: string | null) => {
@@ -38,11 +55,21 @@ const formatTimestamp = (value: string | null) => {
 
 export const App = () => {
   const { theme, mode, toggleMode } = useAppTheme();
+  const [tab, setTab] = useState<"dashboard" | "admin">("dashboard");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [workflows, setWorkflows] = useState<WorkflowItem[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [editingWorkflowId, setEditingWorkflowId] = useState<number | null>(null);
+  const [workflowForm, setWorkflowForm] = useState<WorkflowPayload>({
+    name: "",
+    source_path: "",
+    destination_path: "",
+    failed_path: "",
+    enabled: true,
+  });
 
   const stats = useMemo(
     () => [
@@ -55,7 +82,7 @@ export const App = () => {
     [status]
   );
 
-  const refresh = async () => {
+  const refreshDashboard = async () => {
     setRefreshing(true);
     try {
       const [statusData, historyData] = await Promise.all([fetchStatus(), fetchHistory()]);
@@ -70,19 +97,78 @@ export const App = () => {
     }
   };
 
+  const refreshWorkflows = async () => {
+    try {
+      const items = await fetchWorkflows();
+      setWorkflows(items);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Workflow load failed");
+    }
+  };
+
   const runScan = async () => {
     try {
       await triggerScan();
-      await refresh();
+      await refreshDashboard();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Scan failed");
     }
   };
 
+  const resetWorkflowForm = () => {
+    setEditingWorkflowId(null);
+    setWorkflowForm({
+      name: "",
+      source_path: "",
+      destination_path: "",
+      failed_path: "",
+      enabled: true,
+    });
+  };
+
+  const submitWorkflow = async () => {
+    try {
+      if (editingWorkflowId === null) {
+        await createWorkflow(workflowForm);
+      } else {
+        await updateWorkflow(editingWorkflowId, workflowForm);
+      }
+      await refreshWorkflows();
+      await refreshDashboard();
+      resetWorkflowForm();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Workflow save failed");
+    }
+  };
+
+  const startEditWorkflow = (item: WorkflowItem) => {
+    setEditingWorkflowId(item.id);
+    setWorkflowForm({
+      name: item.name,
+      source_path: item.source_path,
+      destination_path: item.destination_path,
+      failed_path: item.failed_path,
+      enabled: item.enabled,
+    });
+  };
+
+  const removeWorkflow = async (workflowId: number) => {
+    try {
+      await deleteWorkflow(workflowId);
+      await refreshWorkflows();
+      await refreshDashboard();
+      if (editingWorkflowId === workflowId) {
+        resetWorkflowForm();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Workflow delete failed");
+    }
+  };
+
   useEffect(() => {
-    void refresh();
+    void Promise.all([refreshDashboard(), refreshWorkflows()]);
     const timer = setInterval(() => {
-      void refresh();
+      void refreshDashboard();
     }, 10000);
     return () => clearInterval(timer);
   }, []);
@@ -110,14 +196,16 @@ export const App = () => {
                 </Typography>
               </Box>
               <Stack direction="row" spacing={1}>
-                <Button
-                  variant="contained"
-                  startIcon={<AutorenewRoundedIcon />}
-                  onClick={runScan}
-                  disabled={refreshing}
-                >
-                  Scan Now
-                </Button>
+                {tab === "dashboard" && (
+                  <Button
+                    variant="contained"
+                    startIcon={<AutorenewRoundedIcon />}
+                    onClick={runScan}
+                    disabled={refreshing}
+                  >
+                    Scan Now
+                  </Button>
+                )}
                 <IconButton onClick={toggleMode} color="primary">
                   {mode === "dark" ? <LightModeRoundedIcon /> : <DarkModeRoundedIcon />}
                 </IconButton>
@@ -125,12 +213,129 @@ export const App = () => {
             </Toolbar>
           </AppBar>
 
+          <Paper sx={{ mb: 2, border: "1px solid", borderColor: "divider" }}>
+            <Tabs
+              value={tab}
+              onChange={(_, value: "dashboard" | "admin") => setTab(value)}
+              textColor="primary"
+              indicatorColor="primary"
+            >
+              <Tab value="dashboard" label="Dashboard" />
+              <Tab value="admin" label="Admin Workflows" />
+            </Tabs>
+          </Paper>
+
           {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
 
           {loading ? (
             <Box sx={{ display: "grid", placeItems: "center", py: 10 }}>
               <CircularProgress />
             </Box>
+          ) : tab === "admin" ? (
+            <Stack spacing={3}>
+              <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
+                <Typography variant="h6" sx={{ mb: 2 }}>
+                  {editingWorkflowId === null ? "Create Workflow" : `Edit Workflow #${editingWorkflowId}`}
+                </Typography>
+                <Stack spacing={2}>
+                  <TextField
+                    label="Workflow Name"
+                    value={workflowForm.name}
+                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, name: event.target.value }))}
+                    fullWidth
+                  />
+                  <TextField
+                    label="Source Path"
+                    value={workflowForm.source_path}
+                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, source_path: event.target.value }))}
+                    fullWidth
+                  />
+                  <TextField
+                    label="Destination Path"
+                    value={workflowForm.destination_path}
+                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, destination_path: event.target.value }))}
+                    fullWidth
+                  />
+                  <TextField
+                    label="Failed Path"
+                    value={workflowForm.failed_path}
+                    onChange={(event) => setWorkflowForm((prev) => ({ ...prev, failed_path: event.target.value }))}
+                    fullWidth
+                  />
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={workflowForm.enabled}
+                        onChange={(event) =>
+                          setWorkflowForm((prev) => ({ ...prev, enabled: event.target.checked }))
+                        }
+                      />
+                    }
+                    label="Enabled"
+                  />
+                  <Stack direction="row" spacing={1}>
+                    <Button
+                      variant="contained"
+                      onClick={submitWorkflow}
+                      disabled={
+                        !workflowForm.name.trim() ||
+                        !workflowForm.source_path.trim() ||
+                        !workflowForm.destination_path.trim() ||
+                        !workflowForm.failed_path.trim()
+                      }
+                    >
+                      {editingWorkflowId === null ? "Create" : "Save"}
+                    </Button>
+                    <Button variant="outlined" onClick={resetWorkflowForm}>
+                      Clear
+                    </Button>
+                  </Stack>
+                </Stack>
+              </Paper>
+
+              <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
+                <Typography variant="h6" sx={{ mb: 1 }}>
+                  Configured Workflows
+                </Typography>
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Name</TableCell>
+                        <TableCell>Source</TableCell>
+                        <TableCell>Destination</TableCell>
+                        <TableCell>Failed</TableCell>
+                        <TableCell>Status</TableCell>
+                        <TableCell align="right">Actions</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {workflows.map((item) => (
+                        <TableRow key={item.id} hover>
+                          <TableCell>{item.name}</TableCell>
+                          <TableCell sx={{ maxWidth: 160, wordBreak: "break-all" }}>{item.source_path}</TableCell>
+                          <TableCell sx={{ maxWidth: 160, wordBreak: "break-all" }}>{item.destination_path}</TableCell>
+                          <TableCell sx={{ maxWidth: 160, wordBreak: "break-all" }}>{item.failed_path}</TableCell>
+                          <TableCell>
+                            <Chip size="small" color={item.enabled ? "success" : "default"} label={item.enabled ? "enabled" : "disabled"} />
+                          </TableCell>
+                          <TableCell align="right">
+                            <Stack direction="row" spacing={1} justifyContent="flex-end">
+                              <Button size="small" onClick={() => startEditWorkflow(item)}>
+                                Edit
+                              </Button>
+                              <Button size="small" color="error" onClick={() => removeWorkflow(item.id)}>
+                                Delete
+                              </Button>
+                            </Stack>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Paper>
+            </Stack>
           ) : (
             <Stack spacing={3}>
               <Box

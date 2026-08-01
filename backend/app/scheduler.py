@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import select
 
 from app.config import Settings
+from app.db import SessionLocal
 from app.media import MediaProcessor
+from app.models import Workflow
 
 
 class ScanScheduler:
@@ -32,7 +35,16 @@ class ScanScheduler:
     def enqueue_full_scan(self) -> tuple[int, int]:
         discovered = 0
         queued = 0
-        for source_share in self.settings.source_shares:
+
+        source_roots = {Path(path) for path in self.settings.source_shares}
+        with SessionLocal() as session:
+            workflows = session.scalars(select(Workflow).where(Workflow.enabled.is_(True))).all()
+        for workflow in workflows:
+            source_roots.add(Path(workflow.source_path))
+
+        for source_share in source_roots:
+            if not source_share.exists():
+                continue
             for file_path in source_share.rglob("*"):
                 if not file_path.is_file():
                     continue
