@@ -87,6 +87,8 @@ type WorkflowFolderTreeNode = {
   children: WorkflowFolderTreeNode[];
 };
 
+type HistoryTab = "failed" | "duplicate" | "processed";
+
 const workflowPathFieldLabels: Record<WorkflowPathField, string> = {
   source_path: "Source",
   destination_path: "Destination",
@@ -182,6 +184,7 @@ const buildWorkflowFolderTree = (folders: string[]): WorkflowFolderTreeNode[] =>
 export const App = () => {
   const { theme, mode, toggleMode } = useAppTheme();
   const [tab, setTab] = useState<"dashboard" | "admin">("dashboard");
+  const [historyTab, setHistoryTab] = useState<HistoryTab>("failed");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -234,6 +237,22 @@ export const App = () => {
   const [driveOverwriteTarget, setDriveOverwriteTarget] = useState<NetworkDriveItem | null>(null);
 
   const workflowFolderTree = useMemo(() => buildWorkflowFolderTree(workflowFolderOptions), [workflowFolderOptions]);
+  const historyByStatus = useMemo(() => {
+    const grouped: Record<HistoryTab, HistoryItem[]> = {
+      failed: [],
+      duplicate: [],
+      processed: [],
+    };
+
+    for (const item of history) {
+      const status = item.status.toLowerCase();
+      if (status === "failed" || status === "duplicate" || status === "processed") {
+        grouped[status].push(item);
+      }
+    }
+
+    return grouped;
+  }, [history]);
 
   const refreshDashboard = async () => {
     setRefreshing(true);
@@ -1406,6 +1425,17 @@ export const App = () => {
                 <Typography variant="h6" sx={{ mb: 1 }}>
                   Processing History
                 </Typography>
+                <Tabs
+                  value={historyTab}
+                  onChange={(_, value: HistoryTab) => setHistoryTab(value)}
+                  textColor="primary"
+                  indicatorColor="primary"
+                  sx={{ mb: 1 }}
+                >
+                  <Tab value="failed" label={`Failed (${historyByStatus.failed.length})`} />
+                  <Tab value="duplicate" label={`Duplicate (${historyByStatus.duplicate.length})`} />
+                  <Tab value="processed" label={`Processed (${historyByStatus.processed.length})`} />
+                </Tabs>
                 <TableContainer>
                   <Table size="small">
                     <TableHead>
@@ -1418,7 +1448,7 @@ export const App = () => {
                       </TableRow>
                     </TableHead>
                     <TableBody>
-                      {history.map((row) => (
+                      {historyByStatus[historyTab].map((row) => (
                         <TableRow key={row.id} hover>
                           <TableCell>{formatTimestamp(row.created_at)}</TableCell>
                           <TableCell sx={{ maxWidth: 220, wordBreak: "break-all" }}>{row.source_path}</TableCell>
@@ -1445,6 +1475,13 @@ export const App = () => {
                           </TableCell>
                         </TableRow>
                       ))}
+                      {historyByStatus[historyTab].length === 0 && (
+                        <TableRow>
+                          <TableCell colSpan={5} sx={{ color: "text.secondary" }}>
+                            No {historyTab} entries.
+                          </TableCell>
+                        </TableRow>
+                      )}
                     </TableBody>
                   </Table>
                 </TableContainer>
