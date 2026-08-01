@@ -4,6 +4,24 @@ export type StatusResponse = {
   total_processed: number;
   total_failed: number;
   total_duplicates: number;
+  next_scan_at: string | null;
+  last_scan_at: string | null;
+  last_scan_discovered: number;
+  last_scan_queued: number;
+  last_scan_trigger: string | null;
+  scan_interval_seconds: number;
+  scan_schedule_enabled: boolean;
+};
+
+export type ScanScheduleResponse = {
+  enabled: boolean;
+  interval_seconds: number;
+  next_scan_at: string | null;
+};
+
+export type StatsResetResponse = {
+  status: string;
+  deleted_rows: number;
 };
 
 export type HistoryItem = {
@@ -23,6 +41,7 @@ export type WorkflowItem = {
   source_path: string;
   destination_path: string;
   failed_path: string;
+  allowed_extensions: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -33,13 +52,58 @@ export type WorkflowPayload = {
   source_path: string;
   destination_path: string;
   failed_path: string;
+  allowed_extensions: string;
+  enabled: boolean;
+};
+
+export type NetworkDriveItem = {
+  id: number;
+  name: string;
+  smb_path: string;
+  mount_path: string | null;
+  username: string;
+  has_password: boolean;
+  enabled: boolean;
+  connection_status: string;
+  last_checked_at: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type NetworkDrivePayload = {
+  name: string;
+  smb_path: string;
+  mount_path: string;
+  username: string;
+  password: string;
+  enabled: boolean;
+};
+
+export type NetworkDriveClonePayload = {
+  name: string;
+  smb_path: string;
+  mount_path: string;
+  username: string;
+  password?: string;
   enabled: boolean;
 };
 
 const readJson = async <T,>(url: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(url, init);
   if (!response.ok) {
-    throw new Error(`Request failed with ${response.status}`);
+    let detail = "";
+    try {
+      const payload = (await response.json()) as { detail?: string };
+      if (typeof payload?.detail === "string" && payload.detail.trim()) {
+        detail = payload.detail.trim();
+      }
+    } catch {
+      // ignore parse errors and fall back to status-only message
+    }
+    throw new Error(
+      detail ? `Request failed with ${response.status}: ${detail}` : `Request failed with ${response.status}`
+    );
   }
   return (await response.json()) as T;
 };
@@ -47,6 +111,18 @@ const readJson = async <T,>(url: string, init?: RequestInit): Promise<T> => {
 export const fetchStatus = () => readJson<StatusResponse>("/api/status");
 export const fetchHistory = () => readJson<HistoryItem[]>("/api/history?limit=50");
 export const triggerScan = () => readJson<{ discovered: number; queued: number }>("/api/scan", { method: "POST" });
+export const fetchScanSchedule = () => readJson<ScanScheduleResponse>("/api/scan-schedule");
+export const updateScanInterval = (intervalSeconds: number) =>
+  readJson<ScanScheduleResponse>("/api/scan-schedule/interval", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ interval_seconds: intervalSeconds }),
+  });
+export const startScanSchedule = () =>
+  readJson<ScanScheduleResponse>("/api/scan-schedule/start", { method: "POST" });
+export const stopScanSchedule = () =>
+  readJson<ScanScheduleResponse>("/api/scan-schedule/stop", { method: "POST" });
+export const resetStats = () => readJson<StatsResetResponse>("/api/stats/reset", { method: "POST" });
 export const fetchWorkflows = () => readJson<WorkflowItem[]>("/api/workflows");
 export const createWorkflow = (payload: WorkflowPayload) =>
   readJson<WorkflowItem>("/api/workflows", {
@@ -62,5 +138,33 @@ export const updateWorkflow = (workflowId: number, payload: WorkflowPayload) =>
   });
 export const deleteWorkflow = (workflowId: number) =>
   readJson<{ status: string }>(`/api/workflows/${workflowId}`, {
+    method: "DELETE",
+  });
+
+export const fetchNetworkDrives = () => readJson<NetworkDriveItem[]>("/api/network-drives");
+export const createNetworkDrive = (payload: NetworkDrivePayload) =>
+  readJson<NetworkDriveItem>("/api/network-drives", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+export const updateNetworkDrive = (driveId: number, payload: NetworkDrivePayload) =>
+  readJson<NetworkDriveItem>(`/api/network-drives/${driveId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+export const cloneNetworkDrive = (driveId: number, payload: NetworkDriveClonePayload) =>
+  readJson<NetworkDriveItem>(`/api/network-drives/${driveId}/clone`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+export const checkNetworkDrive = (driveId: number) =>
+  readJson<NetworkDriveItem>(`/api/network-drives/${driveId}/check`, {
+    method: "POST",
+  });
+export const deleteNetworkDrive = (driveId: number) =>
+  readJson<{ status: string }>(`/api/network-drives/${driveId}`, {
     method: "DELETE",
   });

@@ -14,7 +14,7 @@ fi
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  python3 python3-venv python3-pip exiftool imagemagick libheif1 cifs-utils nodejs npm rsync ca-certificates curl
+  python3 python3-venv python3-pip exiftool imagemagick libheif1 cifs-utils smbclient nodejs npm rsync ca-certificates curl
 
 PYTHON_BIN="python3"
 PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"

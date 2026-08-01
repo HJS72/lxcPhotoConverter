@@ -35,6 +35,10 @@ Filename format:
 
 `IMG_YYYYMMDD_HHMMSS.ext`
 
+Destination folder layout:
+
+`DESTINATION_SHARE/YYYY/YYYY-MM/IMG_YYYYMMDD_HHMMSS.ext`
+
 Collision suffix:
 
 - `IMG_20260731_164530_01.jpg`

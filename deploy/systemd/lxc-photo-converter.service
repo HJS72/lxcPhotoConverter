@@ -20,7 +20,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-ReadWritePaths=/opt/lxc-photo-converter/backend/data /srv/import /srv/export /srv/failed
+ReadWritePaths=/opt/lxc-photo-converter/backend/data /srv /mnt
 
 [Install]
 WantedBy=multi-user.target

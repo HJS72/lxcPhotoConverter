@@ -36,6 +36,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 HEIC_EXTENSIONS = {".heic", ".heif"}
+FIXED_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 
 
 @dataclass
@@ -48,6 +49,7 @@ class QueueStats:
 class WorkflowTarget:
     destination_path: Path
     failed_path: Path
+    allowed_extensions: set[str] | None
 
 
 class MediaProcessor:
@@ -118,8 +120,13 @@ class MediaProcessor:
                 self.queue.task_done()
 
     def _process_file(self, source_path: Path) -> None:
-        if not self._wait_for_file_ready(source_path):
-            logger.warning("File not ready after retries", extra={"source_path": str(source_path), "status": "failed"})
+        if not self._wait_for_file_ready(
+            source_path,
+            min_age_seconds=self.settings.file_ready_min_age_seconds,
+            stable_checks=self.settings.file_ready_checks,
+            check_interval_seconds=self.settings.file_ready_check_interval_seconds,
+        ):
+            logger.warning("File not stable yet; deferred", extra={"source_path": str(source_path), "status": "deferred"})
             return
 
         source_hash = self._sha256(source_path)
@@ -127,6 +134,13 @@ class MediaProcessor:
         target = self._resolve_target_for_source(source_path)
         target.destination_path.mkdir(parents=True, exist_ok=True)
         target.failed_path.mkdir(parents=True, exist_ok=True)
+
+        if target.allowed_extensions is not None and extension not in target.allowed_extensions:
+            logger.info(
+                "File skipped by workflow extension rules",
+                extra={"source_path": str(source_path), "status": "skipped"},
+            )
+            return
 
         with SessionLocal() as session:
             existing = session.scalar(select(ProcessedMedia).where(ProcessedMedia.source_hash == source_hash))
@@ -159,7 +173,7 @@ class MediaProcessor:
                 work_path = converted_path
                 extension = ".jpg"
 
-            destination_path = self._build_unique_destination(captured_at, extension, target.destination_path)
+            destination_path = self._build_unique_destination(captured_at, extension, target)
             destination_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(work_path), str(destination_path))
             if converted_path is not None and source_path.exists():
@@ -223,14 +237,17 @@ class MediaProcessor:
                     selected = workflow
 
         if selected is not None:
+            allowed_extensions = self._parse_allowed_extensions(selected.allowed_extensions)
             return WorkflowTarget(
                 destination_path=Path(selected.destination_path),
                 failed_path=Path(selected.failed_path),
+                allowed_extensions=allowed_extensions,
             )
 
         return WorkflowTarget(
             destination_path=self.settings.destination_share,
             failed_path=self.settings.failed_share,
+            allowed_extensions=None,
         )
 
     def _build_failed_destination(self, source_path: Path, failed_root: Path, subfolder: str = "") -> Path:
@@ -250,16 +267,43 @@ class MediaProcessor:
                 return candidate
             counter += 1
 
-    def _wait_for_file_ready(self, path: Path, retries: int = 10, delay: float = 1.0) -> bool:
-        previous_size = -1
-        for _ in range(retries):
+    def _wait_for_file_ready(
+        self,
+        path: Path,
+        min_age_seconds: float = 2.0,
+        stable_checks: int = 2,
+        check_interval_seconds: float = 1.0,
+    ) -> bool:
+        previous_signature: tuple[int, int] | None = None
+        stable_count = 0
+        max_attempts = max(stable_checks + 2, stable_checks * 6)
+
+        for _ in range(max_attempts):
             if not path.exists():
                 return False
-            current_size = path.stat().st_size
-            if current_size > 0 and current_size == previous_size:
-                return True
-            previous_size = current_size
-            time.sleep(delay)
+            try:
+                stat = path.stat()
+            except OSError:
+                time.sleep(check_interval_seconds)
+                continue
+
+            signature = (stat.st_size, stat.st_mtime_ns)
+            age_seconds = max(0.0, time.time() - stat.st_mtime)
+            is_stable_now = (
+                stat.st_size > 0
+                and previous_signature == signature
+                and age_seconds >= min_age_seconds
+            )
+
+            if is_stable_now:
+                stable_count += 1
+                if stable_count >= stable_checks:
+                    return True
+            else:
+                stable_count = 0
+
+            previous_signature = signature
+            time.sleep(check_interval_seconds)
         return False
 
     def _convert_heic(self, source_path: Path) -> Path:
@@ -276,19 +320,32 @@ class MediaProcessor:
 
         return temp_path
 
-    def _build_unique_destination(self, captured_at: datetime, extension: str, destination_root: Path) -> Path:
-        base_name = f"IMG_{captured_at.strftime('%Y%m%d_%H%M%S')}"
-        candidate = destination_root / f"{base_name}{extension}"
+    def _build_unique_destination(self, captured_at: datetime, extension: str, target: WorkflowTarget) -> Path:
+        timestamp = captured_at.strftime(FIXED_TIMESTAMP_FORMAT)
+        safe_base = f"IMG_{timestamp}"
+        year_dir = captured_at.strftime("%Y")
+        month_dir = captured_at.strftime("%Y-%m")
+        destination_dir = target.destination_path / year_dir / month_dir
+        candidate = destination_dir / f"{safe_base}{extension}"
         if not candidate.exists():
             return candidate
 
         counter = 1
         while True:
             suffix = f"_{counter:02d}"
-            candidate = destination_root / f"{base_name}{suffix}{extension}"
+            candidate = destination_dir / f"{safe_base}{suffix}{extension}"
             if not candidate.exists():
                 return candidate
             counter += 1
+
+    @staticmethod
+    def _parse_allowed_extensions(raw: str | None) -> set[str] | None:
+        if not raw:
+            return None
+        parts = [item.strip().lower() for item in raw.split(",") if item.strip()]
+        if not parts:
+            return None
+        return {part if part.startswith(".") else f".{part}" for part in parts}
 
     @staticmethod
     def _sha256(path: Path) -> str:

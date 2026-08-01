@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     destination_share: Path = Path("/srv/export")
     failed_share: Path = Path("/srv/failed")
     scan_interval_seconds: int = 120
+    file_ready_min_age_seconds: float = 5.0
+    file_ready_checks: int = 3
+    file_ready_check_interval_seconds: float = 1.0
     observer_recursive: bool = True
     exiftool_path: str = "exiftool"
     magick_path: str = "magick"
