@@ -57,6 +57,7 @@ class NetworkDrive(Base):
     username: Mapped[str] = mapped_column(String(256))
     password: Mapped[str] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(default=True)
+    folder_check_enabled: Mapped[bool] = mapped_column(default=False)
     connection_status: Mapped[str] = mapped_column(String(32), default="unknown")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

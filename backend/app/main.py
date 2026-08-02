@@ -8,12 +8,15 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select
 
 from app.api.routes import router
 from app.config import Settings, get_settings
-from app.db import init_db
+from app.db import SessionLocal, init_db
 from app.logging_config import configure_logging
 from app.media import MediaProcessor
+from app.models import NetworkDrive
+from app.network_drives import check_network_drive, mount_network_drive_via_helper
 from app.scheduler import ScanScheduler
 from app.watcher import ShareWatcher
 
@@ -51,9 +54,42 @@ if frontend_dist.exists():
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
 
 
+def _check_and_mount_network_drives_on_startup() -> None:
+    try:
+        with SessionLocal() as session:
+            drives = session.scalars(select(NetworkDrive).where(NetworkDrive.enabled.is_(True))).all()
+
+            for drive in drives:
+                result = check_network_drive(drive.smb_path, drive.username, drive.password, drive.mount_path)
+
+                if not result.connected and drive.mount_path:
+                    mounted, mount_message = mount_network_drive_via_helper(
+                        drive.smb_path,
+                        drive.mount_path,
+                        drive.username,
+                        drive.password,
+                    )
+                    if mounted:
+                        result = check_network_drive(drive.smb_path, drive.username, drive.password, drive.mount_path)
+                    else:
+                        logger.warning(
+                            "Network drive auto-mount failed on startup",
+                            extra={"drive_id": drive.id, "drive_name": drive.name, "error": mount_message},
+                        )
+
+                drive.connection_status = result.status
+                drive.last_checked_at = result.checked_at
+                drive.last_error = None if result.connected else result.message
+
+            session.commit()
+    except Exception:
+        logger.exception("Startup network drive check failed", extra={"status": "failed"})
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    _check_and_mount_network_drives_on_startup()
     processor.start()
     watcher.start(settings.source_shares, recursive=settings.observer_recursive)
     scheduler.start()

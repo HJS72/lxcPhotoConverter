@@ -77,6 +77,7 @@ export type NetworkDriveItem = {
   username: string;
   has_password: boolean;
   enabled: boolean;
+  folder_check_enabled: boolean;
   connection_status: string;
   last_checked_at: string | null;
   last_error: string | null;
@@ -106,6 +107,113 @@ export type NetworkShareDiscoveryPayload = {
   server: string;
   username: string;
   password: string;
+};
+
+export type FolderAuditPayload = {
+  root_path: string;
+  max_results?: number;
+};
+
+export type FolderDuplicateGroup = {
+  sha256: string;
+  file_count: number;
+  size_bytes: number;
+  paths: string[];
+};
+
+export type FolderAuditResponse = {
+  root_path: string;
+  scanned_folders: number;
+  scanned_files: number;
+  duration_ms: number;
+  heic_count: number;
+  wrong_name_count: number;
+  duplicate_groups_count: number;
+  duplicate_files_count: number;
+  checksum_cache_hits: number;
+  checksum_computed: number;
+  checksum_cache_entries: number;
+  heic_files: string[];
+  wrong_name_files: string[];
+  duplicate_groups: FolderDuplicateGroup[];
+  scan_errors: string[];
+};
+
+export type FolderCheckConfigResponse = {
+  drive_id: number | null;
+  drive_name: string | null;
+  root_path: string | null;
+};
+
+export type FolderCheckSummary = {
+  files_total: number;
+  directories_total: number;
+  duplicates_total: number;
+  wrong_name_total: number;
+  wrong_extension_total: number;
+  exif_invalid_total: number;
+  never_scanned_total: number;
+  changed_total: number;
+};
+
+export type FolderCheckFileItem = {
+  relative_path: string;
+  directory: string;
+  filename: string;
+  extension: string;
+  size_bytes: number;
+  modified_at: string;
+  sha256: string | null;
+  duplicate: boolean;
+  wrong_name: boolean;
+  wrong_extension: boolean;
+  exif_invalid: boolean;
+  never_scanned: boolean;
+  changed_since_last_scan: boolean;
+  exif_capture_at: string | null;
+};
+
+export type FolderCheckScanResponse = {
+  root_path: string;
+  scanned_at: string;
+  duration_ms: number;
+  summary: FolderCheckSummary;
+  files: FolderCheckFileItem[];
+  scan_errors: string[];
+};
+
+export type FolderCheckScanStartResponse = {
+  job_id: string;
+  status: string;
+  message: string;
+};
+
+export type FolderCheckScanStatusResponse = {
+  job_id: string | null;
+  status: string;
+  root_path: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  scanned_directories: number;
+  scanned_files: number;
+  max_files: number;
+  progress_percent: number;
+  current_item: string | null;
+  error_message: string | null;
+  result: FolderCheckScanResponse | null;
+};
+
+export type FolderCheckResolveDuplicatePayload = {
+  sha256: string;
+  keep_relative_path: string;
+};
+
+export type FolderCheckResolveDuplicateResponse = {
+  kept_relative_path: string;
+  deleted_count: number;
+  skipped_missing_count: number;
+  errors: string[];
+  result: FolderCheckScanResponse;
 };
 
 const readJson = async <T,>(url: string, init?: RequestInit): Promise<T> => {
@@ -199,3 +307,37 @@ export const deleteNetworkDrive = (driveId: number) =>
   readJson<{ status: string }>(`/api/network-drives/${driveId}`, {
     method: "DELETE",
   });
+
+export const setNetworkDriveFolderCheck = (driveId: number, selected: boolean) =>
+  readJson<NetworkDriveItem>(`/api/network-drives/${driveId}/folder-check`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selected }),
+  });
+
+export const runFolderAudit = (payload: FolderAuditPayload) =>
+  readJson<FolderAuditResponse>("/api/folder-audit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+export const fetchFolderCheckConfig = () => readJson<FolderCheckConfigResponse>("/api/folder-check/config");
+export const runFolderCheckScan = () =>
+  readJson<FolderCheckScanResponse>("/api/folder-check/scan", {
+    method: "POST",
+  });
+export const startFolderCheckScan = () =>
+  readJson<FolderCheckScanStartResponse>("/api/folder-check/scan/start", {
+    method: "POST",
+  });
+export const fetchFolderCheckScanStatus = () => readJson<FolderCheckScanStatusResponse>("/api/folder-check/scan/status");
+export const fetchFolderCheckLatest = () => readJson<FolderCheckScanResponse>("/api/folder-check/latest");
+export const resolveFolderCheckDuplicateGroup = (payload: FolderCheckResolveDuplicatePayload) =>
+  readJson<FolderCheckResolveDuplicateResponse>("/api/folder-check/duplicates/resolve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+export const folderCheckPreviewUrl = (relativePath: string) =>
+  `/api/folder-check/preview?relative_path=${encodeURIComponent(relativePath)}`;

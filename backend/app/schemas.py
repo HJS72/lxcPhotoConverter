@@ -135,8 +135,120 @@ class NetworkDriveItem(BaseModel):
     username: str
     has_password: bool
     enabled: bool
+    folder_check_enabled: bool
     connection_status: str
     last_checked_at: datetime | None
     last_error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class NetworkDriveFolderCheckUpdate(BaseModel):
+    selected: bool = True
+
+
+class FolderAuditRequest(BaseModel):
+    root_path: str = Field(min_length=1, max_length=1024)
+    max_results: int = Field(default=200, ge=1, le=2000)
+
+
+class FolderDuplicateGroup(BaseModel):
+    sha256: str
+    file_count: int
+    size_bytes: int
+    paths: list[str]
+
+
+class FolderAuditResponse(BaseModel):
+    root_path: str
+    scanned_folders: int
+    scanned_files: int
+    duration_ms: int
+    heic_count: int
+    wrong_name_count: int
+    duplicate_groups_count: int
+    duplicate_files_count: int
+    checksum_cache_hits: int
+    checksum_computed: int
+    checksum_cache_entries: int
+    heic_files: list[str]
+    wrong_name_files: list[str]
+    duplicate_groups: list[FolderDuplicateGroup]
+    scan_errors: list[str]
+
+
+class FolderCheckSummary(BaseModel):
+    files_total: int
+    directories_total: int
+    duplicates_total: int
+    wrong_name_total: int
+    wrong_extension_total: int
+    exif_invalid_total: int
+    never_scanned_total: int
+    changed_total: int
+
+
+class FolderCheckFileItem(BaseModel):
+    relative_path: str
+    directory: str
+    filename: str
+    extension: str
+    size_bytes: int
+    modified_at: datetime
+    sha256: str | None
+    duplicate: bool
+    wrong_name: bool
+    wrong_extension: bool
+    exif_invalid: bool
+    never_scanned: bool
+    changed_since_last_scan: bool
+    exif_capture_at: datetime | None
+
+
+class FolderCheckScanResponse(BaseModel):
+    root_path: str
+    scanned_at: datetime
+    duration_ms: int
+    summary: FolderCheckSummary
+    files: list[FolderCheckFileItem]
+    scan_errors: list[str]
+
+
+class FolderCheckConfigResponse(BaseModel):
+    drive_id: int | None
+    drive_name: str | None
+    root_path: str | None
+
+
+class FolderCheckScanStartResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+
+class FolderCheckScanStatusResponse(BaseModel):
+    job_id: str | None
+    status: str
+    root_path: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    scanned_directories: int
+    scanned_files: int
+    max_files: int
+    progress_percent: int
+    current_item: str | None
+    error_message: str | None
+    result: FolderCheckScanResponse | None
+
+
+class FolderCheckResolveDuplicateRequest(BaseModel):
+    sha256: str = Field(min_length=16, max_length=128)
+    keep_relative_path: str = Field(min_length=1, max_length=4096)
+
+
+class FolderCheckResolveDuplicateResponse(BaseModel):
+    kept_relative_path: str
+    deleted_count: int
+    skipped_missing_count: int
+    errors: list[str]
+    result: FolderCheckScanResponse

@@ -47,6 +47,13 @@ def init_db() -> None:
         network_table_exists = connection.execute(
             text("SELECT name FROM sqlite_master WHERE type='table' AND name='network_drives'")
         ).first()
+        if network_table_exists:
+            network_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(network_drives)"))}
+            if "folder_check_enabled" not in network_columns:
+                connection.execute(
+                    text("ALTER TABLE network_drives ADD COLUMN folder_check_enabled BOOLEAN NOT NULL DEFAULT 0")
+                )
+
         if network_table_exists and settings.database_url.startswith("sqlite"):
             index_rows = connection.execute(text("PRAGMA index_list('network_drives')")).fetchall()
             smb_path_is_unique = False
@@ -70,6 +77,7 @@ def init_db() -> None:
                         username VARCHAR(256) NOT NULL,
                         password TEXT NOT NULL,
                         enabled BOOLEAN NOT NULL,
+                        folder_check_enabled BOOLEAN NOT NULL DEFAULT 0,
                         connection_status VARCHAR(32) NOT NULL,
                         last_checked_at DATETIME,
                         last_error TEXT,
@@ -80,10 +88,12 @@ def init_db() -> None:
                 connection.execute(text("""
                     INSERT INTO network_drives_new (
                         id, name, smb_path, mount_path, username, password, enabled,
+                        folder_check_enabled,
                         connection_status, last_checked_at, last_error, created_at, updated_at
                     )
                     SELECT
                         id, name, smb_path, mount_path, username, password, enabled,
+                        COALESCE(folder_check_enabled, 0),
                         connection_status, last_checked_at, last_error, created_at, updated_at
                     FROM network_drives
                 """))

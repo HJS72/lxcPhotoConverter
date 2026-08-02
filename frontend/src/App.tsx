@@ -4,6 +4,7 @@ import {
   AppBar,
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   Container,
@@ -30,6 +31,7 @@ import {
   Toolbar,
   Typography,
   MenuItem,
+  LinearProgress,
 } from "@mui/material";
 import DarkModeRoundedIcon from "@mui/icons-material/DarkModeRounded";
 import LightModeRoundedIcon from "@mui/icons-material/LightModeRounded";
@@ -43,6 +45,16 @@ import {
   createNetworkDrive,
   discoverNetworkDriveShares,
   deleteNetworkDrive,
+  FolderCheckConfigResponse,
+  FolderCheckFileItem,
+  FolderCheckResolveDuplicateResponse,
+  FolderCheckScanStatusResponse,
+  FolderCheckScanResponse,
+  fetchFolderCheckScanStatus,
+  fetchFolderCheckConfig,
+  fetchFolderCheckLatest,
+  folderCheckPreviewUrl,
+  resolveFolderCheckDuplicateGroup,
   deleteWorkflow,
   fetchHistory,
   fetchNetworkDrives,
@@ -53,6 +65,8 @@ import {
   NetworkDriveItem,
   NetworkDrivePayload,
   resetStats,
+  startFolderCheckScan,
+  setNetworkDriveFolderCheck,
   StatusResponse,
   startScanSchedule,
   stopScanSchedule,
@@ -85,6 +99,12 @@ type WorkflowFolderTreeNode = {
   name: string;
   path: string;
   children: WorkflowFolderTreeNode[];
+};
+
+type FolderCheckTreeNode = {
+  name: string;
+  path: string;
+  children: FolderCheckTreeNode[];
 };
 
 type HistoryTab = "failed" | "duplicate" | "processed";
@@ -181,10 +201,67 @@ const buildWorkflowFolderTree = (folders: string[]): WorkflowFolderTreeNode[] =>
   return toTree(root.children);
 };
 
+const buildFolderCheckTree = (files: FolderCheckFileItem[]): FolderCheckTreeNode[] => {
+  type MutableNode = {
+    name: string;
+    path: string;
+    children: Map<string, MutableNode>;
+  };
+
+  const root: MutableNode = { name: "", path: "", children: new Map() };
+
+  for (const file of files) {
+    const segments = file.directory.split("/").filter(Boolean);
+    let cursor = root;
+    let currentPath = "";
+    for (const segment of segments) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      const existing = cursor.children.get(segment);
+      if (existing) {
+        cursor = existing;
+        continue;
+      }
+      const created: MutableNode = { name: segment, path: currentPath, children: new Map() };
+      cursor.children.set(segment, created);
+      cursor = created;
+    }
+  }
+
+  const toTree = (nodes: Map<string, MutableNode>): FolderCheckTreeNode[] =>
+    [...nodes.values()]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((node) => ({
+        name: node.name,
+        path: node.path,
+        children: toTree(node.children),
+      }));
+
+  return toTree(root.children);
+};
+
 export const App = () => {
   const { theme, mode, toggleMode } = useAppTheme();
-  const [tab, setTab] = useState<"dashboard" | "admin">("dashboard");
+  const [tab, setTab] = useState<"dashboard" | "admin" | "folderCheck">("dashboard");
   const [historyTab, setHistoryTab] = useState<HistoryTab>("failed");
+  const [folderCheckLoading, setFolderCheckLoading] = useState(false);
+  const [folderCheckData, setFolderCheckData] = useState<FolderCheckScanResponse | null>(null);
+  const [folderCheckConfig, setFolderCheckConfig] = useState<FolderCheckConfigResponse | null>(null);
+  const [folderCheckSelectedDirectory, setFolderCheckSelectedDirectory] = useState("");
+  const [folderCheckSelectedFile, setFolderCheckSelectedFile] = useState<FolderCheckFileItem | null>(null);
+  const [folderCheckExpandedPaths, setFolderCheckExpandedPaths] = useState<string[]>([]);
+  const [folderCheckFolderOptions, setFolderCheckFolderOptions] = useState<string[]>([]);
+  const [folderCheckStartedAt, setFolderCheckStartedAt] = useState<number | null>(null);
+  const [folderCheckElapsedSeconds, setFolderCheckElapsedSeconds] = useState(0);
+  const [folderCheckScanJobId, setFolderCheckScanJobId] = useState<string | null>(null);
+  const [folderCheckScanStatus, setFolderCheckScanStatus] = useState<FolderCheckScanStatusResponse | null>(null);
+  const [folderCheckResolvingPath, setFolderCheckResolvingPath] = useState<string | null>(null);
+  const [folderCheckResolvingSha, setFolderCheckResolvingSha] = useState<string | null>(null);
+  const [folderCheckMonitorEnabled, setFolderCheckMonitorEnabled] = useState(true);
+  const [folderCheckMonitorIntervalSeconds, setFolderCheckMonitorIntervalSeconds] = useState("120");
+  const [folderCheckFilter, setFolderCheckFilter] = useState<
+    "all" | "issues" | "duplicates" | "wrong-name" | "wrong-extension" | "exif" | "new" | "changed" | "heic"
+  >("all");
+  const [folderCheckSearch, setFolderCheckSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -253,6 +330,87 @@ export const App = () => {
 
     return grouped;
   }, [history]);
+  const folderCheckTree = useMemo(() => {
+    const fileFolders = (folderCheckData?.files ?? []).map((item) => item.directory).filter(Boolean);
+    const allFolders = [...folderCheckFolderOptions, ...fileFolders];
+    return buildWorkflowFolderTree(allFolders);
+  }, [folderCheckData, folderCheckFolderOptions]);
+  const folderCheckVisibleFiles = useMemo(() => {
+    const files = folderCheckData?.files ?? [];
+    if (!folderCheckSelectedDirectory) {
+      return files;
+    }
+    const prefix = `${folderCheckSelectedDirectory}/`;
+    return files.filter((item) => item.directory === folderCheckSelectedDirectory || item.directory.startsWith(prefix));
+  }, [folderCheckData, folderCheckSelectedDirectory]);
+  const folderCheckFilteredFiles = useMemo(() => {
+    const search = folderCheckSearch.trim().toLowerCase();
+    return folderCheckVisibleFiles.filter((item) => {
+      const matchFilter =
+        folderCheckFilter === "all"
+          ? true
+          : folderCheckFilter === "issues"
+            ? item.duplicate || item.wrong_name || item.wrong_extension || item.exif_invalid
+            : folderCheckFilter === "duplicates"
+              ? item.duplicate
+              : folderCheckFilter === "wrong-name"
+                ? item.wrong_name
+                : folderCheckFilter === "wrong-extension"
+                  ? item.wrong_extension
+                  : folderCheckFilter === "exif"
+                    ? item.exif_invalid
+                    : folderCheckFilter === "new"
+                      ? item.never_scanned
+                      : folderCheckFilter === "changed"
+                        ? item.changed_since_last_scan
+                        : item.extension === ".heic";
+
+      if (!matchFilter) {
+        return false;
+      }
+      if (!search) {
+        return true;
+      }
+
+      return (
+        item.relative_path.toLowerCase().includes(search) ||
+        item.filename.toLowerCase().includes(search) ||
+        (item.sha256 ?? "").toLowerCase().includes(search)
+      );
+    });
+  }, [folderCheckFilter, folderCheckSearch, folderCheckVisibleFiles]);
+  const folderCheckDuplicateGroups = useMemo(() => {
+    const groups = new Map<string, FolderCheckFileItem[]>();
+    for (const item of folderCheckData?.files ?? []) {
+      if (!item.sha256) {
+        continue;
+      }
+      const arr = groups.get(item.sha256) ?? [];
+      arr.push(item);
+      groups.set(item.sha256, arr);
+    }
+
+    return [...groups.entries()]
+      .filter(([, items]) => items.length > 1)
+      .sort((left, right) => right[1].length - left[1].length)
+      .map(([sha256, items]) => ({ sha256, items }));
+  }, [folderCheckData]);
+  const folderCheckSelectedExactDuplicates = useMemo(() => {
+    if (!folderCheckSelectedFile?.sha256 || !folderCheckData) {
+      return [] as FolderCheckFileItem[];
+    }
+    return folderCheckData.files.filter(
+      (item) => item.sha256 === folderCheckSelectedFile.sha256 && item.relative_path !== folderCheckSelectedFile.relative_path
+    );
+  }, [folderCheckData, folderCheckSelectedFile]);
+  const folderCheckHeicCount = useMemo(
+    () => (folderCheckData?.files ?? []).filter((item) => item.extension === ".heic" || item.extension === ".heif").length,
+    [folderCheckData]
+  );
+  const selectedFolderCheckDrive = useMemo(
+    () => networkDrives.find((drive) => drive.folder_check_enabled) ?? null,
+    [networkDrives]
+  );
 
   const refreshDashboard = async () => {
     setRefreshing(true);
@@ -332,6 +490,221 @@ export const App = () => {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Update scan interval failed");
     }
+  };
+
+  const refreshFolderCheckConfig = async () => {
+    try {
+      const config = await fetchFolderCheckConfig();
+      setFolderCheckConfig(config);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Folder Check config load failed");
+    }
+  };
+
+  const refreshFolderCheckFolders = async (driveId: number | null) => {
+    if (driveId === null) {
+      setFolderCheckFolderOptions([]);
+      return;
+    }
+    try {
+      const folders = await fetchNetworkDriveFolders(driveId);
+      const sortedFolders = folders
+        .map((folder) => folder.trim())
+        .filter(Boolean)
+        .sort((left, right) => left.localeCompare(right));
+      setFolderCheckFolderOptions(sortedFolders);
+    } catch {
+      setFolderCheckFolderOptions([]);
+    }
+  };
+
+  const loadLatestFolderCheckResult = async () => {
+    try {
+      const latest = await fetchFolderCheckLatest();
+      setFolderCheckData(latest);
+      if (latest.files.length > 0) {
+        setFolderCheckSelectedFile((prev) => prev ?? latest.files[0]);
+      }
+    } catch {
+      // ignore missing initial result
+    }
+  };
+
+  const executeFolderCheckScan = async () => {
+    if (folderCheckLoading) {
+      return;
+    }
+    if (!selectedFolderCheckDrive) {
+      setError("Select one Folder Check drive in Admin > Network Drives.");
+      return;
+    }
+
+    try {
+      setFolderCheckStartedAt(Date.now());
+      setFolderCheckElapsedSeconds(0);
+      setFolderCheckLoading(true);
+      setFolderCheckScanStatus(null);
+      const started = await startFolderCheckScan();
+      setFolderCheckScanJobId(started.job_id);
+      setError(null);
+      setNotice(started.message);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Folder Check scan failed");
+      setFolderCheckLoading(false);
+      setFolderCheckStartedAt(null);
+    }
+  };
+
+  const ensureFolderCheckDriveConnected = async (): Promise<boolean> => {
+    const drive = selectedFolderCheckDrive;
+    if (!drive) {
+      return false;
+    }
+
+    try {
+      const checked = await checkNetworkDrive(drive.id);
+      if (checked.connection_status === "connected") {
+        return true;
+      }
+      const mounted = await mountNetworkDrive(drive.id);
+      await refreshNetworkDrives();
+      return mounted.connection_status === "connected";
+    } catch {
+      return false;
+    }
+  };
+
+  const toggleFolderCheckTreePath = (path: string) => {
+    setFolderCheckExpandedPaths((prev) =>
+      prev.includes(path) ? prev.filter((item) => item !== path) : [...prev, path]
+    );
+  };
+
+  const copyFolderCheckPath = async (relativePath: string) => {
+    try {
+      await navigator.clipboard.writeText(relativePath);
+      setNotice("Path copied to clipboard.");
+    } catch {
+      setError("Copy failed");
+    }
+  };
+
+  const openFolderCheckMetadataForFile = (item: FolderCheckFileItem) => {
+    setFolderCheckSelectedDirectory(item.directory);
+    setFolderCheckSelectedFile(item);
+    if (!item.directory) {
+      return;
+    }
+    const segments = item.directory.split("/").filter(Boolean);
+    const paths: string[] = [];
+    let cursor = "";
+    for (const segment of segments) {
+      cursor = cursor ? `${cursor}/${segment}` : segment;
+      paths.push(cursor);
+    }
+    setFolderCheckExpandedPaths((prev) => {
+      const merged = new Set(prev);
+      for (const path of paths) {
+        merged.add(path);
+      }
+      return [...merged];
+    });
+  };
+
+  const keepFolderCheckDuplicateFile = async (sha256: string, keepRelativePath: string) => {
+    try {
+      const visiblePaths = folderCheckFilteredFiles.map((item) => item.relative_path);
+      const currentSelectedPath = folderCheckSelectedFile?.relative_path ?? null;
+      setFolderCheckResolvingPath(keepRelativePath);
+      setFolderCheckResolvingSha(sha256);
+      const response: FolderCheckResolveDuplicateResponse = await resolveFolderCheckDuplicateGroup({
+        sha256,
+        keep_relative_path: keepRelativePath,
+      });
+      setFolderCheckData(response.result);
+      const filesByPath = new Map(response.result.files.map((item) => [item.relative_path, item]));
+      const selectedStillExists = currentSelectedPath ? filesByPath.get(currentSelectedPath) ?? null : null;
+
+      if (selectedStillExists) {
+        setFolderCheckSelectedFile(selectedStillExists);
+      } else if (currentSelectedPath) {
+        const currentIndex = visiblePaths.indexOf(currentSelectedPath);
+        let nextSelection: FolderCheckFileItem | null = null;
+
+        if (currentIndex >= 0) {
+          for (let index = currentIndex + 1; index < visiblePaths.length; index += 1) {
+            const candidate = filesByPath.get(visiblePaths[index]);
+            if (candidate) {
+              nextSelection = candidate;
+              break;
+            }
+          }
+          if (!nextSelection) {
+            for (let index = currentIndex - 1; index >= 0; index -= 1) {
+              const candidate = filesByPath.get(visiblePaths[index]);
+              if (candidate) {
+                nextSelection = candidate;
+                break;
+              }
+            }
+          }
+        }
+
+        setFolderCheckSelectedFile(nextSelection ?? response.result.files[0] ?? null);
+      } else {
+        setFolderCheckSelectedFile(response.result.files[0] ?? null);
+      }
+      if (response.errors.length > 0) {
+        setNotice(
+          `Kept 1 file, deleted ${response.deleted_count}, skipped ${response.skipped_missing_count}. ${response.errors.length} errors.`
+        );
+      } else {
+        setNotice(`Kept 1 file, deleted ${response.deleted_count}, skipped ${response.skipped_missing_count}.`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Duplicate resolve failed");
+    } finally {
+      setFolderCheckResolvingPath(null);
+      setFolderCheckResolvingSha(null);
+    }
+  };
+
+  const renderFolderCheckTree = (nodes: FolderCheckTreeNode[], depth = 0): ReactNode[] => {
+    return nodes.flatMap((node) => {
+      const hasChildren = node.children.length > 0;
+      const isExpanded = folderCheckExpandedPaths.includes(node.path);
+      const isActive = folderCheckSelectedDirectory === node.path;
+
+      const row = (
+        <Box key={node.path}>
+          <Stack direction="row" alignItems="center" spacing={1} sx={{ pl: depth * 2 }}>
+            <Button
+              size="small"
+              variant="text"
+              onClick={() => toggleFolderCheckTreePath(node.path)}
+              disabled={!hasChildren}
+              sx={{ minWidth: 26, width: 26, px: 0, fontFamily: "monospace" }}
+            >
+              {hasChildren ? (isExpanded ? "-" : "+") : ""}
+            </Button>
+            <Button
+              size="small"
+              variant={isActive ? "contained" : "text"}
+              onClick={() => setFolderCheckSelectedDirectory(node.path)}
+              sx={{ justifyContent: "flex-start", textTransform: "none", flexGrow: 1 }}
+            >
+              {node.name}
+            </Button>
+          </Stack>
+        </Box>
+      );
+
+      if (!hasChildren || !isExpanded) {
+        return [row];
+      }
+
+      return [row, ...renderFolderCheckTree(node.children, depth + 1)];
+    });
   };
 
   const updateWorkflowPathSelection = (field: WorkflowPathField, driveId: number | null, subfolder: string) => {
@@ -833,8 +1206,26 @@ export const App = () => {
     }
   };
 
+  const toggleFolderCheckDrive = async (driveId: number, selected: boolean) => {
+    try {
+      await setNetworkDriveFolderCheck(driveId, selected);
+      await refreshNetworkDrives();
+      await refreshFolderCheckConfig();
+      setError(null);
+      setNotice(selected ? "Folder Check drive selected." : "Folder Check drive cleared.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Folder Check update failed");
+    }
+  };
+
   useEffect(() => {
-    void Promise.all([refreshDashboard(), refreshWorkflows(), refreshNetworkDrives()]);
+    void Promise.all([
+      refreshDashboard(),
+      refreshWorkflows(),
+      refreshNetworkDrives(),
+      refreshFolderCheckConfig(),
+      loadLatestFolderCheckResult(),
+    ]);
     const timer = setInterval(() => {
       void refreshDashboard();
     }, 10000);
@@ -846,6 +1237,122 @@ export const App = () => {
       setScanIntervalInput(String(status.scan_interval_seconds));
     }
   }, [scanIntervalDirty, status]);
+
+  useEffect(() => {
+    void refreshFolderCheckFolders(selectedFolderCheckDrive?.id ?? null);
+  }, [selectedFolderCheckDrive?.id]);
+
+  useEffect(() => {
+    if (!folderCheckLoading || folderCheckStartedAt === null) {
+      return;
+    }
+
+    const timer = setInterval(() => {
+      const elapsed = Math.max(0, Math.floor((Date.now() - folderCheckStartedAt) / 1000));
+      setFolderCheckElapsedSeconds(elapsed);
+    }, 250);
+
+    return () => clearInterval(timer);
+  }, [folderCheckLoading, folderCheckStartedAt]);
+
+  useEffect(() => {
+    if (!folderCheckScanJobId) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const statusData = await fetchFolderCheckScanStatus();
+        if (cancelled) {
+          return;
+        }
+        setFolderCheckScanStatus(statusData);
+
+        if (statusData.job_id !== folderCheckScanJobId) {
+          return;
+        }
+
+        if (statusData.status === "completed") {
+          const result = statusData.result ?? (await fetchFolderCheckLatest());
+          if (cancelled) {
+            return;
+          }
+          setFolderCheckData(result);
+          setFolderCheckSelectedDirectory("");
+          setFolderCheckExpandedPaths([]);
+          setFolderCheckSelectedFile(result.files[0] ?? null);
+          setFolderCheckLoading(false);
+          setFolderCheckStartedAt(null);
+          setFolderCheckScanJobId(null);
+          setNotice(
+            `Folder Check complete: ${result.summary.files_total} files in ${result.duration_ms}ms. New ${result.summary.never_scanned_total}, changed ${result.summary.changed_total}, duplicates ${result.summary.duplicates_total}.`
+          );
+        }
+
+        if (statusData.status === "failed") {
+          setFolderCheckLoading(false);
+          setFolderCheckStartedAt(null);
+          setFolderCheckScanJobId(null);
+          setError(statusData.error_message ?? "Folder Check scan failed");
+        }
+      } catch {
+        if (!cancelled) {
+          setFolderCheckLoading(false);
+          setFolderCheckStartedAt(null);
+          setFolderCheckScanJobId(null);
+          setError("Folder Check status polling failed");
+        }
+      }
+    };
+
+    void poll();
+    const timer = setInterval(() => {
+      void poll();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [folderCheckScanJobId]);
+
+  useEffect(() => {
+    if (tab !== "folderCheck" || !folderCheckMonitorEnabled || folderCheckLoading || folderCheckScanJobId) {
+      return;
+    }
+
+    const parsedInterval = Number.parseInt(folderCheckMonitorIntervalSeconds, 10);
+    const intervalMs = Number.isFinite(parsedInterval) && parsedInterval > 4 ? parsedInterval * 1000 : 120000;
+
+    const tick = async () => {
+      if (!selectedFolderCheckDrive) {
+        return;
+      }
+      const connected = await ensureFolderCheckDriveConnected();
+      if (!connected) {
+        return;
+      }
+      await executeFolderCheckScan();
+    };
+
+    if (folderCheckData === null) {
+      void tick();
+    }
+    const timer = setInterval(() => {
+      void tick();
+    }, intervalMs);
+
+    return () => clearInterval(timer);
+  }, [
+    tab,
+    folderCheckMonitorEnabled,
+    folderCheckMonitorIntervalSeconds,
+    folderCheckLoading,
+    folderCheckScanJobId,
+    folderCheckData,
+    selectedFolderCheckDrive,
+  ]);
 
   return (
     <ThemeProvider theme={theme}>
@@ -860,7 +1367,7 @@ export const App = () => {
           py: 4,
         }}
       >
-        <Container maxWidth="lg">
+        <Container maxWidth={tab === "folderCheck" ? false : "lg"}>
           <AppBar position="static" color="transparent" elevation={0} sx={{ mb: 3 }}>
             <Toolbar disableGutters sx={{ justifyContent: "space-between" }}>
               <Box>
@@ -908,12 +1415,13 @@ export const App = () => {
           <Paper sx={{ mb: 2, border: "1px solid", borderColor: "divider" }}>
             <Tabs
               value={tab}
-              onChange={(_, value: "dashboard" | "admin") => setTab(value)}
+              onChange={(_, value: "dashboard" | "admin" | "folderCheck") => setTab(value)}
               textColor="primary"
               indicatorColor="primary"
             >
               <Tab value="dashboard" label="Dashboard" />
               <Tab value="admin" label="Admin Workflows" />
+              <Tab value="folderCheck" label="Folder Check" />
             </Tabs>
           </Paper>
 
@@ -984,6 +1492,7 @@ export const App = () => {
                         <TableCell>SMB Path</TableCell>
                         <TableCell>Mount Path</TableCell>
                         <TableCell>User</TableCell>
+                        <TableCell>Folder Check</TableCell>
                         <TableCell>Status</TableCell>
                         <TableCell align="right">Actions</TableCell>
                       </TableRow>
@@ -995,6 +1504,12 @@ export const App = () => {
                           <TableCell sx={{ maxWidth: 180, wordBreak: "break-all" }}>{drive.smb_path}</TableCell>
                           <TableCell sx={{ maxWidth: 180, wordBreak: "break-all" }}>{drive.mount_path ?? "-"}</TableCell>
                           <TableCell>{drive.username}</TableCell>
+                          <TableCell>
+                            <Checkbox
+                              checked={drive.folder_check_enabled}
+                              onChange={(event) => void toggleFolderCheckDrive(drive.id, event.target.checked)}
+                            />
+                          </TableCell>
                           <TableCell>
                             <Stack spacing={0.5}>
                               <Chip
@@ -1341,6 +1856,412 @@ export const App = () => {
                   </Button>
                 </DialogActions>
               </Dialog>
+            </Stack>
+          ) : tab === "folderCheck" ? (
+            <Stack spacing={3}>
+              <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2, wordBreak: "break-all" }}>
+                  Path: {folderCheckConfig?.root_path ?? selectedFolderCheckDrive?.mount_path ?? "Select one drive in Admin > Network Drives"}
+                </Typography>
+                <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }}>
+                  <FormControlLabel
+                    control={<Switch checked={folderCheckMonitorEnabled} onChange={(event) => setFolderCheckMonitorEnabled(event.target.checked)} />}
+                    label="Auto monitor"
+                  />
+                  <TextField
+                    size="small"
+                    type="number"
+                    label="Monitor interval (sec)"
+                    value={folderCheckMonitorIntervalSeconds}
+                    onChange={(event) => setFolderCheckMonitorIntervalSeconds(event.target.value)}
+                    sx={{ maxWidth: 220 }}
+                    inputProps={{ min: 5 }}
+                  />
+                </Stack>
+                <Stack direction="row" spacing={1}>
+                  <Button
+                    variant="contained"
+                    onClick={executeFolderCheckScan}
+                    disabled={folderCheckLoading || !selectedFolderCheckDrive?.mount_path}
+                  >
+                    {folderCheckLoading ? "Scanning..." : "Run Scan"}
+                  </Button>
+                  <Button variant="outlined" onClick={() => void loadLatestFolderCheckResult()} disabled={folderCheckLoading}>
+                    Load Latest
+                  </Button>
+                </Stack>
+                {folderCheckLoading && (
+                  <Box sx={{ mt: 1.5 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      Running checks: recursive traversal, content hash, naming, extension and EXIF validation.
+                    </Typography>
+                    <LinearProgress
+                      variant={folderCheckScanStatus ? "determinate" : "indeterminate"}
+                      value={folderCheckScanStatus?.progress_percent ?? 0}
+                      sx={{ mt: 1, mb: 0.5 }}
+                    />
+                    {folderCheckScanStatus && (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                        Progress: {folderCheckScanStatus.progress_percent}% | folders {folderCheckScanStatus.scanned_directories} | files {folderCheckScanStatus.scanned_files}
+                      </Typography>
+                    )}
+                    {folderCheckScanStatus?.current_item && (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", wordBreak: "break-all" }}>
+                        Current: {folderCheckScanStatus.current_item}
+                      </Typography>
+                    )}
+                    <Typography variant="caption" color="text.secondary">
+                      Elapsed: {folderCheckElapsedSeconds}s
+                    </Typography>
+                  </Box>
+                )}
+              </Paper>
+
+              {folderCheckData && (
+                <Paper sx={{ p: 2, border: "1px solid", borderColor: "divider" }}>
+                  <Typography variant="body2" color="text.secondary">
+                    Root: {folderCheckData.root_path}
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                    Scanned: {formatTimestamp(folderCheckData.scanned_at)} | Duration: {folderCheckData.duration_ms}ms
+                  </Typography>
+                  <Stack direction="row" spacing={1} sx={{ mb: 1, flexWrap: "wrap" }}>
+                    <Chip size="small" color="info" label={`Folders: ${folderCheckData.summary.directories_total}`} />
+                    <Chip size="small" color="info" label={`Files: ${folderCheckData.summary.files_total}`} />
+                    <Chip size="small" color="warning" label={`Duplicates: ${folderCheckData.summary.duplicates_total}`} />
+                    <Chip size="small" color="error" label={`Wrong Name: ${folderCheckData.summary.wrong_name_total}`} />
+                    <Chip size="small" color="warning" label={`HEIC ext: ${folderCheckHeicCount}`} />
+                    <Chip size="small" color="error" label={`Wrong Ext: ${folderCheckData.summary.wrong_extension_total}`} />
+                    <Chip size="small" color="warning" label={`EXIF Invalid: ${folderCheckData.summary.exif_invalid_total}`} />
+                    <Chip size="small" color="success" label={`Never Scanned: ${folderCheckData.summary.never_scanned_total}`} />
+                    <Chip size="small" color="secondary" label={`Changed: ${folderCheckData.summary.changed_total}`} />
+                  </Stack>
+                  <Stack direction={{ xs: "column", md: "row" }} spacing={2} sx={{ mt: 2 }}>
+                    <Paper
+                      sx={{
+                        p: 1.5,
+                        flex: 1,
+                        minHeight: 420,
+                        maxHeight: "70vh",
+                        border: "1px solid",
+                        borderColor: "divider",
+                        overflowY: "scroll",
+                        overflowX: "hidden",
+                      }}
+                    >
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                        Folder Tree
+                      </Typography>
+                      <Button
+                        variant={folderCheckSelectedDirectory === "" ? "contained" : "text"}
+                        size="small"
+                        onClick={() => setFolderCheckSelectedDirectory("")}
+                        sx={{ mb: 1, textTransform: "none" }}
+                      >
+                        Root
+                      </Button>
+                      <Stack spacing={0.5}>{renderFolderCheckTree(folderCheckTree)}</Stack>
+                    </Paper>
+
+                    <Paper
+                      sx={{
+                        p: 1.5,
+                        flex: 1.4,
+                        minHeight: 420,
+                        maxHeight: "70vh",
+                        border: "1px solid",
+                        borderColor: "divider",
+                        overflowY: "scroll",
+                        overflowX: "hidden",
+                      }}
+                    >
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                        Files ({folderCheckFilteredFiles.length}/{folderCheckVisibleFiles.length})
+                      </Typography>
+                      <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }}>
+                        <TextField
+                          size="small"
+                          select
+                          label="Filter"
+                          value={folderCheckFilter}
+                          onChange={(event) => setFolderCheckFilter(event.target.value as typeof folderCheckFilter)}
+                          sx={{ minWidth: 200 }}
+                        >
+                          <MenuItem value="all">All</MenuItem>
+                          <MenuItem value="issues">Issues</MenuItem>
+                          <MenuItem value="duplicates">Duplicates</MenuItem>
+                          <MenuItem value="wrong-name">Wrong name</MenuItem>
+                          <MenuItem value="wrong-extension">Wrong extension</MenuItem>
+                          <MenuItem value="exif">Invalid EXIF</MenuItem>
+                          <MenuItem value="new">Never scanned</MenuItem>
+                          <MenuItem value="changed">Changed</MenuItem>
+                          <MenuItem value="heic">HEIC</MenuItem>
+                        </TextField>
+                        <TextField
+                          size="small"
+                          label="Search"
+                          value={folderCheckSearch}
+                          onChange={(event) => setFolderCheckSearch(event.target.value)}
+                          sx={{ flexGrow: 1 }}
+                        />
+                      </Stack>
+                      <TableContainer sx={{ maxHeight: "58vh" }}>
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Preview</TableCell>
+                              <TableCell>File</TableCell>
+                              <TableCell>Status</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {folderCheckFilteredFiles.map((item) => (
+                              <TableRow
+                                key={item.relative_path}
+                                hover
+                                selected={folderCheckSelectedFile?.relative_path === item.relative_path}
+                                onClick={() => setFolderCheckSelectedFile(item)}
+                                sx={{ cursor: "pointer" }}
+                              >
+                                <TableCell sx={{ width: 64 }}>
+                                  <Box
+                                    component="img"
+                                    key={item.relative_path}
+                                    src={folderCheckPreviewUrl(item.relative_path)}
+                                    alt={item.filename}
+                                    loading="lazy"
+                                    sx={{ width: 48, height: 48, objectFit: "cover", borderRadius: 1, bgcolor: "action.hover" }}
+                                  />
+                                </TableCell>
+                                <TableCell sx={{ maxWidth: 280, wordBreak: "break-all" }}>{item.filename}</TableCell>
+                                <TableCell>
+                                  <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
+                                    {item.duplicate && <Chip size="small" color="warning" label="dup" />}
+                                    {item.wrong_name && <Chip size="small" color="error" label="name" />}
+                                    {item.wrong_extension && <Chip size="small" color="error" label="ext" />}
+                                    {item.exif_invalid && <Chip size="small" color="warning" label="exif" />}
+                                    {item.never_scanned && <Chip size="small" color="success" label="new" />}
+                                    {item.changed_since_last_scan && <Chip size="small" color="secondary" label="changed" />}
+                                  </Stack>
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                            {folderCheckFilteredFiles.length === 0 && (
+                              <TableRow>
+                                <TableCell colSpan={3} sx={{ color: "text.secondary" }}>
+                                  No files for current filter.
+                                </TableCell>
+                              </TableRow>
+                            )}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    </Paper>
+
+                    <Paper sx={{ p: 1.5, flex: 1, minHeight: 420, border: "1px solid", borderColor: "divider", overflow: "auto" }}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                        Details
+                      </Typography>
+                      {folderCheckSelectedFile ? (
+                        <Stack spacing={1}>
+                          <Box
+                            component="img"
+                            key={folderCheckSelectedFile.relative_path}
+                            src={folderCheckPreviewUrl(folderCheckSelectedFile.relative_path)}
+                            alt={folderCheckSelectedFile.filename}
+                            sx={{ width: "100%", maxHeight: 220, objectFit: "contain", borderRadius: 1, bgcolor: "action.hover" }}
+                          />
+                          {folderCheckSelectedFile.duplicate && (
+                            <Button
+                              size="small"
+                              variant="contained"
+                              color="warning"
+                              onClick={() =>
+                                void keepFolderCheckDuplicateFile(
+                                  folderCheckSelectedFile.sha256 ?? "",
+                                  folderCheckSelectedFile.relative_path
+                                )
+                              }
+                              disabled={folderCheckResolvingSha === folderCheckSelectedFile.sha256 || !folderCheckSelectedFile.sha256}
+                            >
+                              {folderCheckResolvingPath === folderCheckSelectedFile.relative_path ? "Working..." : "Keep This"}
+                            </Button>
+                          )}
+                          <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
+                            {folderCheckSelectedFile.relative_path}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            Size: {folderCheckSelectedFile.size_bytes.toLocaleString()} bytes
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            Modified: {formatTimestamp(folderCheckSelectedFile.modified_at)}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            EXIF capture: {formatTimestamp(folderCheckSelectedFile.exif_capture_at)}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary" sx={{ wordBreak: "break-all" }}>
+                            SHA-256: {folderCheckSelectedFile.sha256 ?? "-"}
+                          </Typography>
+                          <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
+                            {folderCheckSelectedFile.duplicate && <Chip size="small" color="warning" label="Exact duplicate" />}
+                            {folderCheckSelectedFile.wrong_name && <Chip size="small" color="error" label="Wrong filename" />}
+                            {folderCheckSelectedFile.wrong_extension && <Chip size="small" color="error" label="Wrong extension" />}
+                            {folderCheckSelectedFile.exif_invalid && <Chip size="small" color="warning" label="Invalid EXIF" />}
+                            {folderCheckSelectedFile.never_scanned && <Chip size="small" color="success" label="Never scanned" />}
+                            {folderCheckSelectedFile.changed_since_last_scan && <Chip size="small" color="secondary" label="Changed since last scan" />}
+                          </Stack>
+                          {folderCheckSelectedFile.duplicate && (
+                            <Box sx={{ mt: 1 }}>
+                              <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+                                Exact duplicates ({folderCheckSelectedExactDuplicates.length})
+                              </Typography>
+                              <Stack spacing={1}>
+                                {folderCheckSelectedExactDuplicates.map((item) => (
+                                  <Stack
+                                    key={item.relative_path}
+                                    direction={{ xs: "column", md: "row" }}
+                                    spacing={1}
+                                    alignItems={{ md: "center" }}
+                                    sx={{ p: 0.5, border: "1px solid", borderColor: "divider", borderRadius: 1 }}
+                                  >
+                                    <Box
+                                      component="img"
+                                      key={item.relative_path}
+                                      src={folderCheckPreviewUrl(item.relative_path)}
+                                      alt={item.filename}
+                                      loading="lazy"
+                                      sx={{ width: 52, height: 52, objectFit: "cover", borderRadius: 1, bgcolor: "action.hover" }}
+                                    />
+                                    <Box sx={{ minWidth: 0, flexGrow: 1 }}>
+                                      <Typography variant="caption" sx={{ display: "block" }}>
+                                        {item.filename}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", wordBreak: "break-all" }}>
+                                        {item.relative_path}
+                                      </Typography>
+                                    </Box>
+                                    <Button
+                                      size="small"
+                                      variant="contained"
+                                      color="warning"
+                                      onClick={() =>
+                                        void keepFolderCheckDuplicateFile(
+                                          item.sha256 ?? "",
+                                          item.relative_path
+                                        )
+                                      }
+                                      disabled={folderCheckResolvingSha === item.sha256 || !item.sha256}
+                                    >
+                                      {folderCheckResolvingPath === item.relative_path ? "Working..." : "Keep This"}
+                                    </Button>
+                                  </Stack>
+                                ))}
+                                {folderCheckSelectedExactDuplicates.length === 0 && (
+                                  <Typography variant="caption" color="text.secondary">
+                                    No other duplicates found for selected file.
+                                  </Typography>
+                                )}
+                              </Stack>
+                            </Box>
+                          )}
+                        </Stack>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          Select a file to inspect details.
+                        </Typography>
+                      )}
+                    </Paper>
+                  </Stack>
+
+                  <Paper sx={{ p: 1.5, mt: 2, border: "1px solid", borderColor: "divider" }}>
+                    <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                      Duplicate Groups ({folderCheckDuplicateGroups.length})
+                    </Typography>
+                    <TableContainer>
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>SHA-256</TableCell>
+                            <TableCell align="right">Files</TableCell>
+                            <TableCell>Preview + Actions</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {folderCheckDuplicateGroups.slice(0, 150).map((group) => (
+                            <TableRow key={group.sha256} hover>
+                              <TableCell sx={{ maxWidth: 240, wordBreak: "break-all" }}>{group.sha256}</TableCell>
+                              <TableCell align="right">{group.items.length}</TableCell>
+                              <TableCell sx={{ maxWidth: 720 }}>
+                                <Stack spacing={1}>
+                                  {group.items.slice(0, 20).map((item) => (
+                                    <Stack
+                                      key={item.relative_path}
+                                      direction={{ xs: "column", md: "row" }}
+                                      spacing={1}
+                                      alignItems={{ md: "center" }}
+                                      sx={{ p: 0.5, border: "1px solid", borderColor: "divider", borderRadius: 1 }}
+                                    >
+                                      <Box
+                                        component="img"
+                                        key={item.relative_path}
+                                        src={folderCheckPreviewUrl(item.relative_path)}
+                                        alt={item.filename}
+                                        loading="lazy"
+                                        sx={{ width: 54, height: 54, objectFit: "cover", borderRadius: 1, bgcolor: "action.hover" }}
+                                      />
+                                      <Typography variant="caption" sx={{ wordBreak: "break-all", flexGrow: 1 }}>
+                                        {item.relative_path}
+                                      </Typography>
+                                      <Stack direction="row" spacing={0.5}>
+                                        <Button size="small" variant="contained" color="warning" onClick={() => void keepFolderCheckDuplicateFile(group.sha256, item.relative_path)} disabled={folderCheckResolvingSha === group.sha256}>
+                                          {folderCheckResolvingPath === item.relative_path ? "Working..." : "Keep This"}
+                                        </Button>
+                                        <Button size="small" variant="outlined" onClick={() => void copyFolderCheckPath(item.relative_path)}>
+                                          Copy
+                                        </Button>
+                                        <Button size="small" variant="outlined" onClick={() => openFolderCheckMetadataForFile(item)}>
+                                          Open Folder
+                                        </Button>
+                                      </Stack>
+                                    </Stack>
+                                  ))}
+                                  {group.items.length > 20 && (
+                                    <Typography variant="caption" color="text.secondary">
+                                      +{group.items.length - 20} more paths
+                                    </Typography>
+                                  )}
+                                </Stack>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                          {folderCheckDuplicateGroups.length === 0 && (
+                            <TableRow>
+                              <TableCell colSpan={3} sx={{ color: "text.secondary" }}>
+                                No duplicates detected in latest scan.
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  </Paper>
+
+                  {folderCheckData.scan_errors.length > 0 && (
+                    <Box sx={{ mt: 2 }}>
+                      <Typography variant="subtitle2" color="warning.main" sx={{ mb: 0.5 }}>
+                        Scan warnings
+                      </Typography>
+                      <Stack spacing={0.5}>
+                        {folderCheckData.scan_errors.map((issue) => (
+                          <Typography key={issue} variant="caption" color="text.secondary" sx={{ wordBreak: "break-all" }}>
+                            {issue}
+                          </Typography>
+                        ))}
+                      </Stack>
+                    </Box>
+                  )}
+                </Paper>
+              )}
             </Stack>
           ) : (
             <Stack spacing={3}>

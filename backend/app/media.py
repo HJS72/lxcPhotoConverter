@@ -244,6 +244,25 @@ class MediaProcessor:
                 self.queue.task_done()
 
     def _process_file(self, source_path: Path) -> None:
+        target = self._resolve_target_for_source(source_path)
+        extension = source_path.suffix.lower()
+
+        if self._is_stale_zero_byte_file(
+            source_path,
+            min_age_seconds=max(60.0, self.settings.file_ready_min_age_seconds * 4),
+        ):
+            self._record_failed_and_quarantine(
+                source_path=source_path,
+                target=target,
+                extension=extension,
+                error_message="Source file is empty (0 bytes)",
+            )
+            logger.warning(
+                "Zero-byte source file moved to failed folder",
+                extra={"source_path": str(source_path), "status": "failed"},
+            )
+            return
+
         if not self._wait_for_file_ready(
             source_path,
             min_age_seconds=self.settings.file_ready_min_age_seconds,
@@ -254,8 +273,6 @@ class MediaProcessor:
             return
 
         source_hash = self._sha256(source_path)
-        extension = source_path.suffix.lower()
-        target = self._resolve_target_for_source(source_path)
 
         if target.allowed_extensions is not None and extension not in target.allowed_extensions:
             logger.info(
@@ -326,38 +343,64 @@ class MediaProcessor:
                 },
             )
         except Exception as exc:
-            try:
-                fail_path = self._build_failed_destination(source_path, target.failed_path)
-                fail_path.parent.mkdir(parents=True, exist_ok=True)
-                if source_path.exists():
-                    shutil.move(str(source_path), str(fail_path))
-            except Exception:
-                logger.exception(
-                    "Failed to move source into failed folder",
-                    extra={"source_path": str(source_path), "status": "failed"},
-                )
-
-            try:
-                with SessionLocal() as session:
-                    session.add(
-                        ProcessedMedia(
-                            source_path=str(source_path),
-                            source_hash=hashlib.sha256(f"{source_hash}:failed:{source_path}:{time.time_ns()}".encode("utf-8")).hexdigest(),
-                            destination_path=None,
-                            extension=extension,
-                            captured_at=None,
-                            status="failed",
-                            error_message=str(exc),
-                        )
-                    )
-                    session.commit()
-            except Exception:
-                logger.exception(
-                    "Failed to record failed processing event",
-                    extra={"source_path": str(source_path), "status": "failed"},
-                )
+            self._record_failed_and_quarantine(
+                source_path=source_path,
+                target=target,
+                extension=extension,
+                error_message=str(exc),
+            )
 
             logger.exception("File processing failed", extra={"source_path": str(source_path), "status": "failed"})
+
+    def _is_stale_zero_byte_file(self, path: Path, min_age_seconds: float) -> bool:
+        if not path.exists() or not path.is_file():
+            return False
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        if stat.st_size != 0:
+            return False
+        age_seconds = time.time() - stat.st_mtime
+        return age_seconds >= min_age_seconds
+
+    def _record_failed_and_quarantine(
+        self,
+        source_path: Path,
+        target: WorkflowTarget,
+        extension: str,
+        error_message: str,
+    ) -> None:
+        try:
+            fail_path = self._build_failed_destination(source_path, target.failed_path)
+            fail_path.parent.mkdir(parents=True, exist_ok=True)
+            if source_path.exists():
+                shutil.move(str(source_path), str(fail_path))
+        except Exception:
+            logger.exception(
+                "Failed to move source into failed folder",
+                extra={"source_path": str(source_path), "status": "failed"},
+            )
+
+        try:
+            with SessionLocal() as session:
+                session.add(
+                    ProcessedMedia(
+                        source_path=str(source_path),
+                        source_hash=hashlib.sha256(f"failed:{source_path}:{time.time_ns()}".encode("utf-8")).hexdigest(),
+                        destination_path=None,
+                        extension=extension,
+                        captured_at=None,
+                        status="failed",
+                        error_message=error_message,
+                    )
+                )
+                session.commit()
+        except Exception:
+            logger.exception(
+                "Failed to record failed processing event",
+                extra={"source_path": str(source_path), "status": "failed"},
+            )
 
     def _resolve_target_for_source(self, source_path: Path) -> WorkflowTarget:
         selected: Workflow | None = None
@@ -411,7 +454,7 @@ class MediaProcessor:
         stable_checks: int = 2,
         check_interval_seconds: float = 1.0,
     ) -> bool:
-        previous_signature: tuple[int, int] | None = None
+        previous_size: int | None = None
         stable_count = 0
         max_attempts = max(stable_checks + 2, stable_checks * 6)
 
@@ -424,22 +467,20 @@ class MediaProcessor:
                 time.sleep(check_interval_seconds)
                 continue
 
-            signature = (stat.st_size, stat.st_mtime_ns)
-            age_seconds = max(0.0, time.time() - stat.st_mtime)
-            is_stable_now = (
-                stat.st_size > 0
-                and previous_signature == signature
-                and age_seconds >= min_age_seconds
-            )
+            age_seconds = time.time() - stat.st_mtime
+            has_future_mtime = age_seconds < 0
+            is_stable_now = stat.st_size > 0 and previous_size == stat.st_size
 
             if is_stable_now:
                 stable_count += 1
-                if stable_count >= stable_checks:
+                # NAS/CIFS can expose clock skew or mtime jitter. If size stays stable
+                # across checks, allow processing even when mtime appears in the future.
+                if stable_count >= stable_checks and (age_seconds >= min_age_seconds or has_future_mtime):
                     return True
             else:
                 stable_count = 0
 
-            previous_signature = signature
+            previous_size = stat.st_size
             time.sleep(check_interval_seconds)
         return False
 
